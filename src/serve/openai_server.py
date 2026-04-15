@@ -5,6 +5,7 @@ import base64
 import binascii
 import io
 import json
+import logging
 import os
 import sys
 import time
@@ -30,6 +31,8 @@ from internvl.conversation import get_conv_template
 from internvl.model.internvl_chat.modeling_unipercept import InternVLChatModel
 
 from .openai_types import ChatCompletionRequest, ChatCompletionResponse, ModelObject
+
+logger = logging.getLogger(__name__)
 
 
 def _now_ts() -> int:
@@ -159,7 +162,7 @@ def _load_model(model_path: str, device: torch.device) -> Tuple[InternVLChatMode
     ).to(device).eval()
 
     gen_cfg = dict(
-        max_new_tokens=int(os.environ.get("MAX_NEW_TOKENS", "1024")),
+        max_new_tokens=int(os.environ.get("MAX_NEW_TOKENS", "512")),
         do_sample=_env_bool("DO_SAMPLE", False),
         temperature=float(os.environ.get("TEMPERATURE", "0")) if _env_bool("DO_SAMPLE", False) else None,
         pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
@@ -167,6 +170,71 @@ def _load_model(model_path: str, device: torch.device) -> Tuple[InternVLChatMode
     # Remove None fields to avoid transformers warnings.
     gen_cfg = {k: v for k, v in gen_cfg.items() if v is not None}
     return model, tokenizer, gen_cfg
+
+
+def _config_effective_image_size(cfg: Any) -> int:
+    return int(getattr(cfg, "force_image_size", None) or cfg.vision_config.image_size)
+
+
+def _validate_vision_env_against_config(model: InternVLChatModel) -> None:
+    raw = os.environ.get("VISION_INPUT_SIZE")
+    if not raw:
+        return
+    want = int(raw.strip())
+    expected = _config_effective_image_size(model.config)
+    if want != expected:
+        msg = (
+            f"VISION_INPUT_SIZE={want} must equal the model's effective image_size={expected} "
+            f"(force_image_size or vision_config.image_size). Adjust the env var or edit config.json, then restart."
+        )
+        if _env_bool("STRICT_VISION_INPUT_SIZE", True):
+            raise RuntimeError(msg)
+        logger.warning("%s", msg)
+
+
+def _log_model_inference_profile(model: InternVLChatModel, device: torch.device, gen_cfg: Dict) -> None:
+    llm_impl = getattr(model.config.llm_config, "attn_implementation", None)
+    vit_fa = getattr(model.config.vision_config, "use_flash_attn", None)
+    eff = _config_effective_image_size(model.config)
+    env_vi = os.environ.get("VISION_INPUT_SIZE")
+    eff_dtype = next(model.parameters()).dtype
+    logger.info(
+        "UniPercept inference profile: device=%s param_dtype=%s max_new_tokens=%s llm_attn_implementation=%s "
+        "vision_use_flash_attn=%s config_image_size=%s VISION_INPUT_SIZE=%s",
+        device,
+        str(eff_dtype),
+        gen_cfg.get("max_new_tokens"),
+        llm_impl,
+        vit_fa,
+        eff,
+        env_vi if env_vi is not None else f"(unset, using {eff})",
+    )
+
+
+def _max_images_per_request() -> int:
+    return max(1, int(os.environ.get("MAX_IMAGES_PER_REQUEST", "8")))
+
+
+def _max_prompt_total_chars() -> Optional[int]:
+    v = int(os.environ.get("MAX_PROMPT_TOTAL_CHARS", "0"))
+    return None if v <= 0 else v
+
+
+def _inference_profile_snapshot() -> Dict[str, Any]:
+    if STATE.model is None:
+        return {}
+    m = STATE.model
+    eff = _config_effective_image_size(m.config)
+    return {
+        "param_dtype": str(next(m.parameters()).dtype),
+        "llm_attn_implementation": getattr(m.config.llm_config, "attn_implementation", None),
+        "vision_use_flash_attn": getattr(m.config.vision_config, "use_flash_attn", None),
+        "config_effective_image_size": eff,
+        "vision_input_size_effective": _vision_input_size(),
+        "max_new_tokens": STATE.gen_cfg.get("max_new_tokens") if STATE.gen_cfg else None,
+        "max_images_per_request": _max_images_per_request(),
+        "max_prompt_total_chars": os.environ.get("MAX_PROMPT_TOTAL_CHARS", "0"),
+    }
 
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -378,8 +446,29 @@ def _messages_to_prompt_and_pixels(messages: List[dict]) -> Tuple[str, Optional[
     prompt_chunks.append(last_user_text)
     prompt = "\n".join([c for c in prompt_chunks if c.strip()])
 
+    max_prompt_limit = _max_prompt_total_chars()
+    if max_prompt_limit is not None and len(prompt) > max_prompt_limit:
+        slim_chunks: List[str] = []
+        if sys_lines:
+            slim_chunks.append("\n".join(sys_lines))
+        slim_chunks.append(last_user_text)
+        prompt = "\n".join([c for c in slim_chunks if c.strip()])
+        if len(prompt) > max_prompt_limit:
+            keep = max_prompt_limit - 48
+            prompt = (prompt[:keep] if keep > 0 else "").rstrip() + "\n... [prompt truncated by MAX_PROMPT_TOTAL_CHARS]"
+        logger.info("Prompt exceeded MAX_PROMPT_TOTAL_CHARS=%s; dropped middle chat history.", max_prompt_limit)
+
     pixel_values_cpu: Optional[torch.Tensor] = None
     if pending_urls:
+        mx = _max_images_per_request()
+        if len(pending_urls) > mx:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Too many images in the latest user message ({len(pending_urls)}); "
+                    f"max is {mx} (set MAX_IMAGES_PER_REQUEST)."
+                ),
+            )
         try:
             pixel_values_cpu = _load_stacked_pixel_values_cpu(pending_urls)
         except ValueError as e:
@@ -507,6 +596,8 @@ async def lifespan(app: FastAPI):
     # Load once at startup so weights live in RAM/GPU memory.
     t0 = time.time()
     model, tokenizer, gen_cfg = _load_model(STATE.model_path, STATE.device)
+    _validate_vision_env_against_config(model)
+    _log_model_inference_profile(model, STATE.device, gen_cfg)
 
     # Warmup: a tiny generate to force lazy init / CUDA kernels.
     try:
@@ -541,13 +632,17 @@ app = FastAPI(title="UniPercept OpenAI-Compatible Server", lifespan=lifespan)
 
 @app.get("/health")
 async def health():
-    return {
+    out: Dict[str, Any] = {
         "status": "ok",
         "model_loaded": STATE.model is not None,
         "device": str(STATE.device),
         "model_id": STATE.model_id,
         "load_seconds": getattr(app.state, "load_seconds", None),
     }
+    prof = _inference_profile_snapshot()
+    if prof:
+        out["inference_profile"] = prof
+    return out
 
 
 @app.get("/v1/models")
