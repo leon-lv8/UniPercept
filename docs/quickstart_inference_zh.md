@@ -113,6 +113,19 @@ huggingface-cli login
 - 先关闭其他占显存进程：`nvidia-smi`
 - 改用 CPU（脚本会自动检测并回退）
 - 或更换更小图片进行测试
+- 服务化部署可启用 8bit 量化（推荐）：
+
+```bash
+# 开启 8bit（目标：将空载显存降到 10GB 级）
+LOAD_IN_8BIT=true LOAD_IN_4BIT=false docker compose --profile gpu up --build
+
+# 回滚到原始 bf16 加载
+LOAD_IN_8BIT=false LOAD_IN_4BIT=false docker compose --profile gpu up --build
+```
+
+- 建议同时收紧请求峰值参数（在 `docker-compose.yml` 的 environment 配置）：
+  - `MAX_IMAGES_PER_REQUEST=1`
+  - `MAX_NEW_TOKENS=256`
 
 ### Q5: 提示找不到模型目录
 

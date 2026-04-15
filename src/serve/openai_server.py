@@ -4,6 +4,7 @@ import asyncio
 import base64
 import binascii
 import csv
+import gc
 import io
 import json
 import logging
@@ -22,7 +23,7 @@ import torch
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from PIL import Image, ImageFile
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, BitsAndBytesConfig
 from transformers.generation.streamers import TextIteratorStreamer
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -82,6 +83,45 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _post_infer_cuda_cleanup(device: Optional[torch.device]) -> None:
+    """Release transient tensors and optionally return cached blocks to CUDA driver."""
+    if device is None or device.type != "cuda":
+        return
+    if _env_bool("GC_COLLECT_AFTER_REQUEST", True):
+        gc.collect()
+    if _env_bool("EMPTY_CUDA_CACHE_AFTER_REQUEST", True):
+        torch.cuda.empty_cache()
+
+
+def _configured_system_prompt() -> Tuple[Optional[str], Optional[str]]:
+    inline_prompt = os.environ.get("SYSTEM_PROMPT")
+    if inline_prompt is not None:
+        inline_prompt = inline_prompt.strip()
+
+    file_path = (os.environ.get("SYSTEM_PROMPT_FILE") or "").strip()
+    file_prompt: Optional[str] = None
+    if file_path:
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                file_prompt = f.read().strip()
+        except OSError as e:
+            raise RuntimeError(f"Failed to read SYSTEM_PROMPT_FILE: {file_path}") from e
+
+    if inline_prompt:
+        return inline_prompt, "SYSTEM_PROMPT"
+    if file_prompt:
+        return file_prompt, f"SYSTEM_PROMPT_FILE({file_path})"
+    return None, None
+
+
+def _apply_system_prompt_override(model: InternVLChatModel) -> None:
+    prompt, source = _configured_system_prompt()
+    if not prompt:
+        return
+    model.system_message = prompt
+    logger.info("System prompt override applied from %s", source)
 
 
 def _model_id_suggests_vision_capabilities(model_id: str) -> bool:
@@ -152,16 +192,50 @@ def _select_dtype(device: torch.device) -> torch.dtype:
     return torch.float32
 
 
+def _quantization_flags() -> Tuple[bool, bool]:
+    load_in_8bit = _env_bool("LOAD_IN_8BIT", False)
+    load_in_4bit = _env_bool("LOAD_IN_4BIT", False)
+    if load_in_8bit and load_in_4bit:
+        raise RuntimeError("LOAD_IN_8BIT and LOAD_IN_4BIT cannot both be true")
+    return load_in_8bit, load_in_4bit
+
+
+def _quantized_device_map(device: torch.device):
+    if device.type != "cuda":
+        raise RuntimeError("8bit/4bit quantization requires CUDA device")
+    return {"": device.index if device.index is not None else 0}
+
+
+def _quantization_config(load_in_8bit: bool, load_in_4bit: bool) -> Optional[BitsAndBytesConfig]:
+    if not (load_in_8bit or load_in_4bit):
+        return None
+    if load_in_8bit:
+        return BitsAndBytesConfig(load_in_8bit=True)
+    return BitsAndBytesConfig(load_in_4bit=True)
+
+
 def _load_model(model_path: str, device: torch.device) -> Tuple[InternVLChatModel, object, Dict]:
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, use_fast=False)
 
     dtype = _select_dtype(device)
+    load_in_8bit, load_in_4bit = _quantization_flags()
+    quantized = load_in_8bit or load_in_4bit
+    model_kwargs: Dict[str, Any] = {
+        "torch_dtype": dtype,
+        "low_cpu_mem_usage": True,
+        "use_flash_attn": _env_bool("USE_FLASH_ATTN", True),
+    }
+    if quantized:
+        model_kwargs["device_map"] = _quantized_device_map(device)
+        model_kwargs["quantization_config"] = _quantization_config(load_in_8bit, load_in_4bit)
     model = InternVLChatModel.from_pretrained(
         model_path,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
-        use_flash_attn=_env_bool("USE_FLASH_ATTN", True),
-    ).to(device).eval()
+        **model_kwargs,
+    )
+    if quantized:
+        model = model.eval()
+    else:
+        model = model.to(device).eval()
 
     gen_cfg = dict(
         max_new_tokens=int(os.environ.get("MAX_NEW_TOKENS", "512")),
@@ -200,11 +274,15 @@ def _log_model_inference_profile(model: InternVLChatModel, device: torch.device,
     eff = _config_effective_image_size(model.config)
     env_vi = os.environ.get("VISION_INPUT_SIZE")
     eff_dtype = next(model.parameters()).dtype
+    load_in_8bit = bool(getattr(model, "is_loaded_in_8bit", False))
+    load_in_4bit = bool(getattr(model, "is_loaded_in_4bit", False))
     logger.info(
-        "UniPercept inference profile: device=%s param_dtype=%s max_new_tokens=%s llm_attn_implementation=%s "
-        "vision_use_flash_attn=%s config_image_size=%s VISION_INPUT_SIZE=%s",
+        "UniPercept inference profile: device=%s param_dtype=%s load_in_8bit=%s load_in_4bit=%s "
+        "max_new_tokens=%s llm_attn_implementation=%s vision_use_flash_attn=%s config_image_size=%s VISION_INPUT_SIZE=%s",
         device,
         str(eff_dtype),
+        load_in_8bit,
+        load_in_4bit,
         gen_cfg.get("max_new_tokens"),
         llm_impl,
         vit_fa,
@@ -229,6 +307,8 @@ def _inference_profile_snapshot() -> Dict[str, Any]:
     eff = _config_effective_image_size(m.config)
     return {
         "param_dtype": str(next(m.parameters()).dtype),
+        "load_in_8bit": bool(getattr(m, "is_loaded_in_8bit", False)),
+        "load_in_4bit": bool(getattr(m, "is_loaded_in_4bit", False)),
         "llm_attn_implementation": getattr(m.config.llm_config, "attn_implementation", None),
         "vision_use_flash_attn": getattr(m.config.vision_config, "use_flash_attn", None),
         "config_effective_image_size": eff,
@@ -255,6 +335,8 @@ _HEALTH_TOP_DESC: Dict[str, str] = {
 
 _INFERENCE_PROFILE_DESC: Dict[str, str] = {
     "param_dtype": "模型参数的数据类型（例如 bfloat16、float32）。",
+    "load_in_8bit": "是否启用 8bit 量化权重加载（bitsandbytes）。",
+    "load_in_4bit": "是否启用 4bit 量化权重加载（bitsandbytes）。",
     "llm_attn_implementation": "语言模型注意力实现方式（如 flash_attention_2、eager 等）。",
     "vision_use_flash_attn": "视觉编码器（ViT）侧是否启用 FlashAttention 类加速实现。",
     "config_effective_image_size": "配置中生效的输入图像边长（像素），来自 force_image_size 或 vision_config。",
@@ -694,7 +776,11 @@ class _State:
 
 STATE = _State()
 
-def _iter_tokens_via_streamer(question: str, pixel_values: Optional[torch.Tensor]) -> Tuple["TextIteratorStreamer", Thread]:
+def _iter_tokens_via_streamer(
+    question: str,
+    pixel_values: Optional[torch.Tensor],
+    generation_config: Dict[str, Any],
+) -> Tuple["TextIteratorStreamer", Thread]:
     if STATE.model is None or STATE.tokenizer is None or STATE.gen_cfg is None or STATE.device is None:
         raise RuntimeError("Model is not loaded")
 
@@ -706,7 +792,7 @@ def _iter_tokens_via_streamer(question: str, pixel_values: Optional[torch.Tensor
         skip_special_tokens=True,
     )
 
-    generate_kwargs = dict(STATE.gen_cfg)
+    generate_kwargs = dict(generation_config)
     generate_kwargs["eos_token_id"] = eos_token_id
     generate_kwargs["streamer"] = streamer
 
@@ -737,6 +823,7 @@ async def lifespan(app: FastAPI):
     # Load once at startup so weights live in RAM/GPU memory.
     t0 = time.time()
     model, tokenizer, gen_cfg = _load_model(STATE.model_path, STATE.device)
+    _apply_system_prompt_override(model)
     _validate_vision_env_against_config(model)
     _log_model_inference_profile(model, STATE.device, gen_cfg)
 
@@ -807,6 +894,7 @@ async def chat_completions(req: Request):
     model_name = body.get("model") or STATE.model_id
     messages = body.get("messages") or []
     stream = bool(body.get("stream", False))
+    request_max_tokens = body.get("max_tokens")
 
     if STATE.model is None or STATE.tokenizer is None or STATE.gen_cfg is None or STATE.device is None:
         raise HTTPException(status_code=503, detail="Model is not loaded")
@@ -823,6 +911,15 @@ async def chat_completions(req: Request):
 
     created = _now_ts()
     resp_id = f"chatcmpl-{uuid.uuid4().hex}"
+    generation_config = dict(STATE.gen_cfg)
+    if request_max_tokens is not None:
+        try:
+            parsed_max_tokens = int(request_max_tokens)
+        except (TypeError, ValueError) as e:
+            raise HTTPException(status_code=400, detail="max_tokens must be an integer") from e
+        if parsed_max_tokens <= 0:
+            raise HTTPException(status_code=400, detail="max_tokens must be > 0")
+        generation_config["max_new_tokens"] = parsed_max_tokens
 
     def _pixels_to_device(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         if t is None:
@@ -832,20 +929,27 @@ async def chat_completions(req: Request):
     async def run_infer() -> str:
         # Serialize access to a single model instance to avoid GPU OOM / thread-unsafe kernels.
         async with STATE.lock:
-            with torch.no_grad():
-                pixel_values = _pixels_to_device(pixel_values_cpu)
-                out = STATE.model.chat(
-                    str(STATE.device),
-                    STATE.tokenizer,
-                    pixel_values,
-                    prompt,
-                    dict(STATE.gen_cfg),
-                    history=None,
-                    return_history=False,
-                )
-                if STATE.device.type == "cuda":
-                    torch.cuda.synchronize(STATE.device)
-                return out.strip()
+            pixel_values = None
+            out = ""
+            try:
+                with torch.no_grad():
+                    pixel_values = _pixels_to_device(pixel_values_cpu)
+                    out = STATE.model.chat(
+                        str(STATE.device),
+                        STATE.tokenizer,
+                        pixel_values,
+                        prompt,
+                        generation_config,
+                        history=None,
+                        return_history=False,
+                    )
+                    if STATE.device.type == "cuda":
+                        torch.cuda.synchronize(STATE.device)
+                    return out.strip()
+            finally:
+                del pixel_values
+                del out
+                _post_infer_cuda_cleanup(STATE.device)
 
     if not stream:
         text = await run_infer()
@@ -880,7 +984,7 @@ async def chat_completions(req: Request):
         # True incremental streaming via transformers streamer.
         async with STATE.lock:
             pixel_values = _pixels_to_device(pixel_values_cpu)
-            streamer, gen_thread = _iter_tokens_via_streamer(prompt, pixel_values)
+            streamer, gen_thread = _iter_tokens_via_streamer(prompt, pixel_values, generation_config)
             try:
                 it = iter(streamer)
                 while True:
@@ -901,6 +1005,8 @@ async def chat_completions(req: Request):
                 # Client disconnect/cancel must not release the lock while generate() still runs;
                 # otherwise the next request starts a second forward and CUDA OOMs.
                 await asyncio.to_thread(gen_thread.join)
+                del pixel_values
+                _post_infer_cuda_cleanup(STATE.device)
 
         # Final chunk
         yield _sse_event(

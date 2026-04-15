@@ -41,9 +41,15 @@ services:
       MODEL_ID: unipercept
       PORT: "8000"
       PREFER_CUDA: "true"
+      LOAD_IN_8BIT: "true"
+      LOAD_IN_4BIT: "false"
+      MAX_IMAGES_PER_REQUEST: "1"
+      MAX_NEW_TOKENS: "1024"
+      GC_COLLECT_AFTER_REQUEST: "true"
+      EMPTY_CUDA_CACHE_AFTER_REQUEST: "true"
+      IMAGE_MAX_BYTES: 52428800  # 50MB
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
     volumes:
       - ./ckpt/unipercept:/models/unipercept:ro
-      - ./examples:/workspace/examples:ro
     gpus: all
