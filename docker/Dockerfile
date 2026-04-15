@@ -66,7 +66,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 COPY src /workspace/src
 COPY docker/entrypoint.sh /workspace/docker/entrypoint.sh
 
-RUN chmod +x /workspace/docker/entrypoint.sh
+RUN sed -i 's/\r$//' /workspace/docker/entrypoint.sh && \
+    chmod +x /workspace/docker/entrypoint.sh
 
 EXPOSE 8000
 
