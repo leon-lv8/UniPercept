@@ -1,0 +1,38 @@
+.git
+.git/**
+.cursor
+.cursor/**
+**/__pycache__/
+**/*.py[cod]
+**/*.so
+**/*.a
+**/*.o
+**/*.log
+
+# Data, checkpoints, outputs
+ckpt
+ckpt/**
+results
+results/**
+benchmark/.cache
+benchmark/.cache/**
+benchmark/VQA
+benchmark/VQA/**
+benchmark/VR
+benchmark/VR/**
+examples
+examples/**
+
+# Docs and local notes not needed at runtime
+docs
+docs/**
+note.md
+README.md
+README_zh.md
+
+# Keep build context minimal: include only runtime essentials
+*
+!src/
+!src/**
+!docker/
+!docker/**

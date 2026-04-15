@@ -1,0 +1,49 @@
+# GPU 需要：宿主机 NVIDIA 驱动可用（nvidia-smi）+ nvidia-container-toolkit，且已生成 CDI 规范供 Docker 发现。
+# 若报错 "failed to discover GPU vendor from CDI: no known GPU vendor found"（Docker 29+ 常见）：
+#   1) 收集证据：在仓库根目录执行 python3 scripts/agent_gpu_cdi_debug.py
+#   2) 宿主机修复（需 sudo）：sudo mkdir -p /etc/cdi && sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+#      然后：sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker
+#   3) 验证：docker run --rm --gpus all nvidia/cuda:12.0.0-base-ubuntu22.04 nvidia-smi
+# 无 GPU 时可取消注释 unipercept-cpu，并不要加 --profile gpu。
+
+services:
+  # unipercept-cpu:
+  #   build:
+  #     context: .
+  #     dockerfile: docker/Dockerfile
+  #     args:
+  #       INSTALL_FLASH_ATTN: "false"
+  #   image: unipercept-openai:latest
+  #   container_name: unipercept-openai-cpu
+  #   ports:
+  #     - "8001:8000"
+  #   environment:
+  #     MODEL_PATH: /models/unipercept
+  #     MODEL_ID: unipercept-vl
+  #     PORT: "8000"
+  #     PREFER_CUDA: "false"
+  #   volumes:
+  #     - ./ckpt/unipercept:/models/unipercept:ro
+  #     - ./examples:/workspace/examples:ro
+
+  unipercept-gpu:
+    profiles: ["gpu"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        INSTALL_FLASH_ATTN: "false"
+    image: unipercept-openai:latest
+    container_name: unipercept-openai-gpu
+    ports:
+      - "8000:8000"
+    environment:
+      MODEL_ID: unipercept
+      PORT: "8000"
+      PREFER_CUDA: "true"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - ./ckpt/unipercept:/models/unipercept:ro
+      - ./examples:/workspace/examples:ro
+    gpus: all

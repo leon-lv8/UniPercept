@@ -20,3 +20,4 @@ src/open-r1-multimodal/
 **/__pycache__/
 *.py[cod]
 results/
+examples/
