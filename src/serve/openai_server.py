@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import csv
 import io
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 import uuid
@@ -235,6 +237,145 @@ def _inference_profile_snapshot() -> Dict[str, Any]:
         "max_images_per_request": _max_images_per_request(),
         "max_prompt_total_chars": os.environ.get("MAX_PROMPT_TOTAL_CHARS", "0"),
     }
+
+
+def _described(value: Any, description_zh: str) -> Dict[str, str | Any]:
+    return {"value": value, "description": description_zh}
+
+
+_HEALTH_TOP_DESC: Dict[str, str] = {
+    "status": "服务健康状态；ok 表示 HTTP 服务可用。",
+    "model_loaded": "模型权重是否已完成加载并可处理推理请求。",
+    "device": "推理使用的 PyTorch 设备（如 cuda:0 或 cpu）。",
+    "model_id": "对外暴露的模型标识（可与 OpenAI 兼容客户端中的 model 字段对应）。",
+    "load_seconds": "启动阶段加载模型所耗时间（秒）。",
+    "inference_profile": "推理与视觉管线相关的关键配置快照（便于排查性能与显存问题）。",
+    "gpu": "通过 nvidia-smi 查询到的 NVIDIA GPU 状态（无 GPU 或命令不可用时见子字段说明）。",
+}
+
+_INFERENCE_PROFILE_DESC: Dict[str, str] = {
+    "param_dtype": "模型参数的数据类型（例如 bfloat16、float32）。",
+    "llm_attn_implementation": "语言模型注意力实现方式（如 flash_attention_2、eager 等）。",
+    "vision_use_flash_attn": "视觉编码器（ViT）侧是否启用 FlashAttention 类加速实现。",
+    "config_effective_image_size": "配置中生效的输入图像边长（像素），来自 force_image_size 或 vision_config。",
+    "vision_input_size_effective": "图像预处理实际使用的边长；可被环境变量 VISION_INPUT_SIZE 覆盖。",
+    "max_new_tokens": "单次对话生成时允许的新增 token 数量上限。",
+    "max_images_per_request": "单个请求中允许附带的最大图像数量。",
+    "max_prompt_total_chars": "环境变量 MAX_PROMPT_TOTAL_CHARS 的原始值；0 表示不按字符数截断提示。",
+}
+
+_NVIDIA_SMI_QUERY = (
+    "index,name,memory.total,memory.used,memory.free,temperature.gpu,"
+    "utilization.gpu,utilization.memory,uuid,pci.bus_id,power.draw,power.limit,driver_version"
+)
+
+_NVIDIA_SMI_FIELD_KEYS = [
+    "index",
+    "name",
+    "memory_total_mib",
+    "memory_used_mib",
+    "memory_free_mib",
+    "temperature_gpu_c",
+    "utilization_gpu_pct",
+    "utilization_memory_pct",
+    "uuid",
+    "pci_bus_id",
+    "power_draw_w",
+    "power_limit_w",
+    "driver_version",
+]
+
+_GPU_SECTION_DESC: Dict[str, str] = {
+    "nvidia_smi_ok": "是否成功执行 nvidia-smi 并解析到至少一块 GPU。",
+    "nvidia_smi_error": "当查询失败时，简要错误信息；成功时为 null。",
+    "devices": "各 GPU 的静态与实时指标列表（数值来自 nvidia-smi 查询时刻）。",
+}
+
+_NVIDIA_SMI_LEAF_DESC: Dict[str, str] = {
+    "index": "GPU 设备索引。",
+    "name": "GPU 产品名称/型号。",
+    "memory_total_mib": "显存总容量（MiB）。",
+    "memory_used_mib": "当前已使用显存（MiB）。",
+    "memory_free_mib": "当前空闲显存（MiB）。",
+    "temperature_gpu_c": "GPU 核心温度（摄氏度）。",
+    "utilization_gpu_pct": "GPU 计算利用率（%）。",
+    "utilization_memory_pct": "显存控制器利用率（%）。",
+    "uuid": "GPU 唯一标识符（UUID）。",
+    "pci_bus_id": "PCI 总线 ID。",
+    "power_draw_w": "当前功耗读数（瓦）；部分空闲状态下可能为 [N/A]。",
+    "power_limit_w": "功耗上限（瓦）。",
+    "driver_version": "NVIDIA 驱动版本号（与具体 GPU 行重复属 nvidia-smi 正常行为）。",
+}
+
+
+def _coerce_gpu_csv_field(key: str, raw: str) -> Any:
+    t = raw.strip()
+    if t in {"", "[N/A]", "N/A", "[Unknown Error]"}:
+        return None
+    if key in ("name", "uuid", "pci_bus_id", "driver_version"):
+        return t
+    if key == "index":
+        try:
+            return int(t)
+        except ValueError:
+            return t
+    try:
+        return float(t) if "." in t else int(t)
+    except ValueError:
+        return t
+
+
+def _nvidia_smi_gpu_devices() -> Tuple[bool, Optional[str], List[Dict[str, Any]]]:
+    """Run nvidia-smi once; return (ok, error_message_or_none, list of flat gpu dicts)."""
+    try:
+        proc = subprocess.run(
+            [
+                "nvidia-smi",
+                f"--query-gpu={_NVIDIA_SMI_QUERY}",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=float(os.environ.get("NVIDIA_SMI_TIMEOUT_SEC", "8")),
+            check=False,
+        )
+    except FileNotFoundError:
+        return False, "nvidia-smi 未找到（可能未安装 NVIDIA 驱动或未在 PATH 中）", []
+    except subprocess.TimeoutExpired:
+        return False, "nvidia-smi 执行超时", []
+
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip() or f"exit code {proc.returncode}"
+        return False, err[:500], []
+
+    lines = [ln.strip() for ln in (proc.stdout or "").strip().splitlines() if ln.strip()]
+    if not lines:
+        return False, "nvidia-smi 无输出（可能无可用 GPU）", []
+
+    devices: List[Dict[str, Any]] = []
+    for line in lines:
+        row = next(csv.reader(io.StringIO(line)))
+        if len(row) < len(_NVIDIA_SMI_FIELD_KEYS):
+            continue
+        d: Dict[str, Any] = {}
+        for i, key in enumerate(_NVIDIA_SMI_FIELD_KEYS):
+            d[key] = _coerce_gpu_csv_field(key, row[i])
+        devices.append(d)
+
+    if not devices:
+        return False, "未能解析 nvidia-smi 的 CSV 输出", []
+    return True, None, devices
+
+
+def _wrap_inference_profile(prof: Dict[str, Any]) -> Dict[str, Dict[str, str | Any]]:
+    return {k: _described(v, _INFERENCE_PROFILE_DESC.get(k, f"配置项「{k}」。")) for k, v in prof.items()}
+
+
+def _wrap_gpu_devices(devices: List[Dict[str, Any]]) -> List[Dict[str, Dict[str, str | Any]]]:
+    out: List[Dict[str, Dict[str, str | Any]]] = []
+    for dev in devices:
+        out.append({k: _described(dev[k], _NVIDIA_SMI_LEAF_DESC[k]) for k in _NVIDIA_SMI_FIELD_KEYS if k in dev})
+    return out
 
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -632,16 +773,26 @@ app = FastAPI(title="UniPercept OpenAI-Compatible Server", lifespan=lifespan)
 
 @app.get("/health")
 async def health():
-    out: Dict[str, Any] = {
-        "status": "ok",
-        "model_loaded": STATE.model is not None,
-        "device": str(STATE.device),
-        "model_id": STATE.model_id,
-        "load_seconds": getattr(app.state, "load_seconds", None),
-    }
+    ok_smi, smi_err, gpu_devices = await asyncio.to_thread(_nvidia_smi_gpu_devices)
     prof = _inference_profile_snapshot()
+
+    out: Dict[str, Any] = {
+        "status": _described("ok", _HEALTH_TOP_DESC["status"]),
+        "model_loaded": _described(STATE.model is not None, _HEALTH_TOP_DESC["model_loaded"]),
+        "device": _described(str(STATE.device), _HEALTH_TOP_DESC["device"]),
+        "model_id": _described(STATE.model_id, _HEALTH_TOP_DESC["model_id"]),
+        "load_seconds": _described(getattr(app.state, "load_seconds", None), _HEALTH_TOP_DESC["load_seconds"]),
+        "gpu": _described(
+            {
+                "nvidia_smi_ok": _described(ok_smi, _GPU_SECTION_DESC["nvidia_smi_ok"]),
+                "nvidia_smi_error": _described(smi_err, _GPU_SECTION_DESC["nvidia_smi_error"]),
+                "devices": _described(_wrap_gpu_devices(gpu_devices), _GPU_SECTION_DESC["devices"]),
+            },
+            _HEALTH_TOP_DESC["gpu"],
+        ),
+    }
     if prof:
-        out["inference_profile"] = prof
+        out["inference_profile"] = _described(_wrap_inference_profile(prof), _HEALTH_TOP_DESC["inference_profile"])
     return out
 
 
