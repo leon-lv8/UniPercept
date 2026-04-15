@@ -33,6 +33,8 @@ services:
       dockerfile: docker/Dockerfile
       args:
         INSTALL_FLASH_ATTN: "false"
+        INSTALL_GIT: "${INSTALL_GIT:-false}"
+        INSTALL_BITSANDBYTES: "${INSTALL_BITSANDBYTES:-true}"
     image: unipercept-openai:latest
     container_name: unipercept-openai-gpu
     ports:
@@ -41,15 +43,15 @@ services:
       MODEL_ID: unipercept
       PORT: "8000"
       PREFER_CUDA: "true"
+      SYSTEM_PROMPT_FILE: /workspace/config/system_prompt.txt
       LOAD_IN_8BIT: "true"
       LOAD_IN_4BIT: "false"
       MAX_IMAGES_PER_REQUEST: "1"
       MAX_NEW_TOKENS: "1024"
-      GC_COLLECT_AFTER_REQUEST: "true"
-      EMPTY_CUDA_CACHE_AFTER_REQUEST: "true"
       IMAGE_MAX_BYTES: 52428800  # 50MB
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
     volumes:
       - ./ckpt/unipercept:/models/unipercept:ro
+      - ./config:/workspace/config:ro
     gpus: all

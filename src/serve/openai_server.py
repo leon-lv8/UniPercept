@@ -4,7 +4,6 @@ import asyncio
 import base64
 import binascii
 import csv
-import gc
 import io
 import json
 import logging
@@ -23,8 +22,13 @@ import torch
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from PIL import Image, ImageFile
-from transformers import AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoTokenizer
 from transformers.generation.streamers import TextIteratorStreamer
+
+try:
+    from transformers import BitsAndBytesConfig
+except Exception:
+    BitsAndBytesConfig = None  # type: ignore[assignment]
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -83,16 +87,6 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _post_infer_cuda_cleanup(device: Optional[torch.device]) -> None:
-    """Release transient tensors and optionally return cached blocks to CUDA driver."""
-    if device is None or device.type != "cuda":
-        return
-    if _env_bool("GC_COLLECT_AFTER_REQUEST", True):
-        gc.collect()
-    if _env_bool("EMPTY_CUDA_CACHE_AFTER_REQUEST", True):
-        torch.cuda.empty_cache()
 
 
 def _configured_system_prompt() -> Tuple[Optional[str], Optional[str]]:
@@ -209,6 +203,11 @@ def _quantized_device_map(device: torch.device):
 def _quantization_config(load_in_8bit: bool, load_in_4bit: bool) -> Optional[BitsAndBytesConfig]:
     if not (load_in_8bit or load_in_4bit):
         return None
+    if BitsAndBytesConfig is None:
+        raise RuntimeError(
+            "bitsandbytes support is not available. Rebuild with INSTALL_BITSANDBYTES=true "
+            "or disable LOAD_IN_8BIT/LOAD_IN_4BIT."
+        )
     if load_in_8bit:
         return BitsAndBytesConfig(load_in_8bit=True)
     return BitsAndBytesConfig(load_in_4bit=True)
@@ -929,27 +928,20 @@ async def chat_completions(req: Request):
     async def run_infer() -> str:
         # Serialize access to a single model instance to avoid GPU OOM / thread-unsafe kernels.
         async with STATE.lock:
-            pixel_values = None
-            out = ""
-            try:
-                with torch.no_grad():
-                    pixel_values = _pixels_to_device(pixel_values_cpu)
-                    out = STATE.model.chat(
-                        str(STATE.device),
-                        STATE.tokenizer,
-                        pixel_values,
-                        prompt,
-                        generation_config,
-                        history=None,
-                        return_history=False,
-                    )
-                    if STATE.device.type == "cuda":
-                        torch.cuda.synchronize(STATE.device)
-                    return out.strip()
-            finally:
-                del pixel_values
-                del out
-                _post_infer_cuda_cleanup(STATE.device)
+            with torch.no_grad():
+                pixel_values = _pixels_to_device(pixel_values_cpu)
+                out = STATE.model.chat(
+                    str(STATE.device),
+                    STATE.tokenizer,
+                    pixel_values,
+                    prompt,
+                    generation_config,
+                    history=None,
+                    return_history=False,
+                )
+                if STATE.device.type == "cuda":
+                    torch.cuda.synchronize(STATE.device)
+                return out.strip()
 
     if not stream:
         text = await run_infer()
@@ -1005,8 +997,6 @@ async def chat_completions(req: Request):
                 # Client disconnect/cancel must not release the lock while generate() still runs;
                 # otherwise the next request starts a second forward and CUDA OOMs.
                 await asyncio.to_thread(gen_thread.join)
-                del pixel_values
-                _post_infer_cuda_cleanup(STATE.device)
 
         # Final chunk
         yield _sse_event(
