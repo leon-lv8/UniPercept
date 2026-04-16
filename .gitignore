@@ -16,6 +16,10 @@ src/open-r1-multimodal/
 *.ckpt
 *.pth
 
+# secrets (e.g. HF_TOKEN for docker compose / hf-download)
+.env
+.env.*
+
 # others
 **/__pycache__/
 *.py[cod]

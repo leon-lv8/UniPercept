@@ -1,12 +1,32 @@
 # GPU 需要：宿主机 NVIDIA 驱动可用（nvidia-smi）+ nvidia-container-toolkit，且已生成 CDI 规范供 Docker 发现。
 # 若报错 "failed to discover GPU vendor from CDI: no known GPU vendor found"（Docker 29+ 常见）：
-#   1) 收集证据：在仓库根目录执行 python3 scripts/agent_gpu_cdi_debug.py
-#   2) 宿主机修复（需 sudo）：sudo mkdir -p /etc/cdi && sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
-#      然后：sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker
-#   3) 验证：docker run --rm --gpus all nvidia/cuda:12.0.0-base-ubuntu22.04 nvidia-smi
+#   在宿主机执行（Ubuntu/Debian，需 sudo）：bash scripts/setup_host_env.sh
+#   （Docker 与镜像加速、可选 .run 驱动、有 GPU 时 CDI、hf 模型下载均在同脚本中按步骤执行）
+#   手工等价步骤：sudo mkdir -p /etc/cdi && sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+#   然后：sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker
+#   验证：docker run --rm --gpus all nvidia/cuda:12.0.0-base-ubuntu22.04 nvidia-smi
 # 无 GPU 时可取消注释 unipercept-cpu，并不要加 --profile gpu。
+#
+# 仅下载 HF 权重（镜像基础：python:3.12-slim-bookworm + 官方 hf CLI；需 token 时传入 HF_TOKEN，勿提交到 Git）：
+#   export HF_TOKEN=hf_xxx   # 或写入已加入 .gitignore 的 .env
+#   docker compose build hf-download
+#   docker compose --profile download run --rm hf-download
+# 模型写入 ./ckpt/unipercept，与 unipercept-gpu 挂载路径一致。
 
 services:
+  hf-download:
+    profiles: ["download"]
+    build:
+      context: .
+      dockerfile: docker/hf-download/Dockerfile
+    image: unipercept-hf-download:latest
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+      HF_MODEL_ID: ${HF_MODEL_ID:-Thunderbolt215215/UniPercept}
+      HF_ENDPOINT: ${HF_ENDPOINT:-}
+    volumes:
+      - ./ckpt/unipercept:/out
+
   # unipercept-cpu:
   #   build:
   #     context: .

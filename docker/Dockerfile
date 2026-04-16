@@ -77,4 +77,3 @@ ENV MODEL_PATH=/models/unipercept \
     USE_FLASH_ATTN=true
 
 ENTRYPOINT ["/workspace/docker/entrypoint.sh"]
-
