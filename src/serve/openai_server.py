@@ -8,11 +8,12 @@ import io
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from threading import Thread
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
@@ -325,6 +326,8 @@ def _described(value: Any, description_zh: str) -> Dict[str, str | Any]:
 _HEALTH_TOP_DESC: Dict[str, str] = {
     "status": "服务健康状态；ok 表示 HTTP 服务可用。",
     "model_loaded": "模型权重是否已完成加载并可处理推理请求。",
+    "model_loading": "模型是否仍在后台加载（为 true 时推理接口会返回 503）。",
+    "model_load_error": "模型加载失败时的错误摘要；成功或未失败时为 null。",
     "device": "推理使用的 PyTorch 设备（如 cuda:0 或 cpu）。",
     "model_id": "对外暴露的模型标识（可与 OpenAI 兼容客户端中的 model 字段对应）。",
     "load_seconds": "启动阶段加载模型所耗时间（秒）。",
@@ -835,6 +838,8 @@ class _State:
     model_id: str = "unipercept"
     model_path: str = ""
     model_list_created: int = 0
+    model_loading: bool = False
+    model_load_error: Optional[str] = None
     lock: asyncio.Lock
 
     def __init__(self) -> None:
@@ -844,10 +849,189 @@ class _State:
 STATE = _State()
 
 
+def _model_unavailable_detail() -> str:
+    if STATE.model_load_error:
+        return f"模型加载失败：{STATE.model_load_error}"
+    if STATE.model_loading:
+        return "模型正在后台加载中，请稍后再试；也可访问 GET /health 查看 model_loaded、model_loading 等字段。"
+    return "模型未就绪，无法处理推理请求。"
+
+
+def _raise_if_model_unavailable() -> None:
+    if (
+        STATE.model is not None
+        and STATE.tokenizer is not None
+        and STATE.gen_cfg is not None
+        and STATE.device is not None
+    ):
+        return
+    raise HTTPException(status_code=503, detail=_model_unavailable_detail())
+
+# 带图时固定跑 IAA/IQA/ISTA 三项 score；可用环境变量 AUTO_SCORE_WITH_IMAGE=0 关闭（仅文本对话行为）。
+# JSON_SCORE_IN_USER_PROMPT=1：有图且自动打分时，将三行分数注入 user 文案再 chat，assistant 中不再前置分数块（与 JSON 系统提示搭配）。
+_SCORE_ALL_METRICS = ("iaa", "iqa", "ista")
+
+
+def _auto_score_metrics(pixel_values_cpu: Optional[torch.Tensor]) -> List[str]:
+    if pixel_values_cpu is None:
+        return []
+    if not _env_bool("AUTO_SCORE_WITH_IMAGE", True):
+        return []
+    return list(_SCORE_ALL_METRICS)
+
+
+def _score_desc_for_metric(metric: str) -> str:
+    if metric == "iaa":
+        return "aesthetics"
+    if metric == "iqa":
+        return "quality"
+    if metric == "ista":
+        return "structure and texture richness"
+    raise ValueError(f"unknown score metric: {metric!r}")
+
+
+def _question_is_visual_only_placeholder(q: str) -> bool:
+    """True if, after removing <image>, there is no user text left (score-only or image-only turns)."""
+    t = q.strip()
+    if not t:
+        return True
+    return not t.replace("<image>", "").strip()
+
+
+# 与 score 行展示一致；用于识别并剔除模型在正文开头仿造的分项行（无 /100、多为整数）
+_FAKE_METRIC_LINE = re.compile(r"^\s*(IAA|IQA|ISTA)\s*:\s*\d+\s*$", re.IGNORECASE)
+
+_SCORE_LINE_LABEL_CN = {
+    "iaa": "IAA（审美吸引力）",
+    "iqa": "IQA（技术画质）",
+    "ista": "ISTA（叙事与表达）",
+}
+
+
+def _strip_leading_hallucinated_score_tail(text: str) -> str:
+    """去掉 chat 开头误生成的 score() 及紧随的整型假分项行（真分值为 xx.xx/100，由服务端单独输出）。"""
+    if not text:
+        return text
+    lines = text.splitlines(keepends=True)
+    i = 0
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    if i < len(lines) and re.fullmatch(r"score\s*\(\s*\)", lines[i].strip(), flags=re.IGNORECASE):
+        i += 1
+        while i < len(lines) and not lines[i].strip():
+            i += 1
+    while i < len(lines):
+        core = lines[i].rstrip("\r\n")
+        if not core.strip():
+            break
+        if not _FAKE_METRIC_LINE.match(core):
+            break
+        i += 1
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    return "".join(lines[i:])
+
+
+def _compute_score_block(
+    pixel_values: torch.Tensor,
+    generation_config: Dict[str, Any],
+    metrics: List[str],
+) -> Tuple[str, Dict[str, float]]:
+    """Return display lines (same as before) plus successful metric -> float for callers."""
+    if STATE.model is None or STATE.tokenizer is None or STATE.device is None:
+        raise RuntimeError("Model is not loaded")
+    values: Dict[str, float] = {}
+    out_lines: List[str] = []
+    for metric in metrics:
+        label = _SCORE_LINE_LABEL_CN[metric]
+        try:
+            s = STATE.model.score(
+                str(STATE.device),
+                STATE.tokenizer,
+                pixel_values,
+                generation_config,
+                _score_desc_for_metric(metric),
+                history=None,
+            )
+            fv = float(s)
+            values[metric] = fv
+            out_lines.append(f"{label}: {fv:.2f}/100")
+        except Exception:
+            logger.exception("model.score failed for metric=%s", metric)
+            out_lines.append(f"{label}: （计算失败）")
+    # 多行分值，末尾保留换行，便于与后续 chat 正文分隔
+    return "\n".join(out_lines) + "\n", values
+
+
+def _score_block_for_user_prompt(score_block: str) -> str:
+    """Trim trailing whitespace; wrap with instruction for JSON aesthetic.scores."""
+    body = score_block.rstrip()
+    return (
+        "【以下为服务端已确定的 IAA/IQA/ISTA 评分，请在输出 JSON 的 aesthetic.scores 中"
+        "使用 iaa/iqa/ista 三个数字字段填入与下列完全一致的数值（保留一位或两位小数均可，"
+        "但必须与下列分数一致）；不得改写或另造分数。】\n"
+        f"{body}"
+    )
+
+
+def _question_with_json_score_injection(question: str, score_block: str) -> str:
+    suffix = _score_block_for_user_prompt(score_block)
+    if not question.strip():
+        return suffix
+    return f"{question.rstrip()}\n\n{suffix}"
+
+
+def _repair_assistant_json_corruption(text: str) -> str:
+    """Fix common model JSON mistakes (e.g. '\" \"value' after colon) and normalize if parseable."""
+    if not text or not text.lstrip().startswith("{"):
+        return text
+    raw = text
+    s = text.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"\s*```\s*$", "", s).strip()
+    if not s.startswith("{"):
+        return raw
+
+    def _apply_heuristic_fixes(blob: str) -> str:
+        t = blob
+        prev = None
+        while prev != t:
+            prev = t
+            # Fixes `": "` + whitespace + `"` + value (spurious quote); avoid eating closing quote of `" ",` etc.
+            t = re.sub(r'(:\s*")\s+"(?=[^,"\]}])', r"\1", t)
+        t = t.replace('"sharp_and_noise":', '"sharpness_and_noise":')
+        t = re.sub(
+            r'"image_observed"\s*:\s*"true"',
+            '"image_observed": true',
+            t,
+            flags=re.IGNORECASE,
+        )
+        t = re.sub(
+            r'"image_observed"\s*:\s*"false"',
+            '"image_observed": false',
+            t,
+            flags=re.IGNORECASE,
+        )
+        return t
+
+    try:
+        json.loads(s)
+        return s
+    except json.JSONDecodeError:
+        pass
+
+    fixed = _apply_heuristic_fixes(s)
+    try:
+        obj = json.loads(fixed)
+        return json.dumps(obj, ensure_ascii=False)
+    except json.JSONDecodeError:
+        return fixed if fixed != s else raw
+
+
 def _merge_request_generation_config(body: ChatCompletionRequest) -> Dict[str, Any]:
     """Start from STATE.gen_cfg, then apply OpenAI-style per-request sampling overrides."""
-    if STATE.gen_cfg is None or STATE.device is None:
-        raise HTTPException(status_code=503, detail="Model is not loaded")
+    _raise_if_model_unavailable()
     cfg: Dict[str, Any] = dict(STATE.gen_cfg)
     greedy_forced = False
     temp_explicit = "temperature" in body and body.get("temperature") is not None
@@ -923,6 +1107,43 @@ def _iter_tokens_via_streamer(
     return streamer, gen_thread
 
 
+def _load_model_worker(app: FastAPI) -> None:
+    """Blocking: load weights into GPU/RAM, optional warmup, then publish globals on STATE."""
+    t0 = time.time()
+    try:
+        model, tokenizer, gen_cfg = _load_model(STATE.model_path, STATE.device)  # type: ignore[arg-type]
+        _apply_system_prompt_override(model)
+        _validate_vision_env_against_config(model)
+        _log_model_inference_profile(model, STATE.device, gen_cfg)  # type: ignore[arg-type]
+
+        try:
+            with torch.no_grad():
+                _ = model.chat(
+                    str(STATE.device),
+                    tokenizer,
+                    None,
+                    "你好",
+                    gen_cfg,
+                    history=None,
+                    return_history=False,
+                )
+            if STATE.device.type == "cuda":  # type: ignore[union-attr]
+                torch.cuda.synchronize(STATE.device)
+        except Exception:
+            pass
+
+        STATE.tokenizer = tokenizer
+        STATE.gen_cfg = gen_cfg
+        STATE.model_list_created = _now_ts()
+        STATE.model = model
+        app.state.load_seconds = time.time() - t0
+    except Exception as e:
+        STATE.model_load_error = str(e)[:2000]
+        logger.exception("Model load failed")
+    finally:
+        STATE.model_loading = False
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     STATE.model_id = os.environ.get("MODEL_ID", "unipercept")
@@ -932,39 +1153,32 @@ async def lifespan(app: FastAPI):
     if not os.path.exists(STATE.model_path):
         raise RuntimeError(f"MODEL_PATH does not exist: {STATE.model_path}")
 
-    # Load once at startup so weights live in RAM/GPU memory.
-    t0 = time.time()
-    model, tokenizer, gen_cfg = _load_model(STATE.model_path, STATE.device)
-    _apply_system_prompt_override(model)
-    _validate_vision_env_against_config(model)
-    _log_model_inference_profile(model, STATE.device, gen_cfg)
+    STATE.model = None
+    STATE.tokenizer = None
+    STATE.gen_cfg = None
+    STATE.model_list_created = 0
+    STATE.model_load_error = None
+    STATE.model_loading = True
+    app.state.load_seconds = None
 
-    # Warmup: a tiny generate to force lazy init / CUDA kernels.
-    try:
-        with torch.no_grad():
-            _ = model.chat(
-                str(STATE.device),
-                tokenizer,
-                None,
-                "你好",
-                gen_cfg,
-                history=None,
-                return_history=False,
-            )
-        if STATE.device.type == "cuda":
-            torch.cuda.synchronize(STATE.device)
-    except Exception:
-        # Warmup failure should not prevent serving; model is still loaded.
-        pass
+    async def _run_load() -> None:
+        try:
+            await asyncio.to_thread(_load_model_worker, app)
+        except Exception:
+            logger.exception("Background model load task raised")
+            if STATE.model_load_error is None:
+                STATE.model_load_error = "后台加载任务异常退出（详见服务日志）。"
+            STATE.model_loading = False
 
-    STATE.model = model
-    STATE.tokenizer = tokenizer
-    STATE.gen_cfg = gen_cfg
-    STATE.model_list_created = _now_ts()
+    app.state.model_load_task = asyncio.create_task(_run_load())
 
-    load_s = time.time() - t0
-    app.state.load_seconds = load_s
     yield
+
+    t = getattr(app.state, "model_load_task", None)
+    if t is not None and not t.done():
+        t.cancel()
+        with suppress(asyncio.CancelledError):
+            await t
 
 
 app = FastAPI(title="UniPercept OpenAI-Compatible Server", lifespan=lifespan)
@@ -978,6 +1192,8 @@ async def health():
     out: Dict[str, Any] = {
         "status": _described("ok", _HEALTH_TOP_DESC["status"]),
         "model_loaded": _described(STATE.model is not None, _HEALTH_TOP_DESC["model_loaded"]),
+        "model_loading": _described(STATE.model_loading, _HEALTH_TOP_DESC["model_loading"]),
+        "model_load_error": _described(STATE.model_load_error, _HEALTH_TOP_DESC["model_load_error"]),
         "device": _described(str(STATE.device), _HEALTH_TOP_DESC["device"]),
         "model_id": _described(STATE.model_id, _HEALTH_TOP_DESC["model_id"]),
         "load_seconds": _described(getattr(app.state, "load_seconds", None), _HEALTH_TOP_DESC["load_seconds"]),
@@ -997,6 +1213,7 @@ async def health():
 
 @app.get("/v1/models")
 async def list_models():
+    _raise_if_model_unavailable()
     return {"object": "list", "data": _model_catalog_entries()}
 
 
@@ -1008,8 +1225,7 @@ async def chat_completions(req: Request):
     stream = bool(body.get("stream", False))
     request_max_tokens = body.get("max_tokens")
 
-    if STATE.model is None or STATE.tokenizer is None or STATE.gen_cfg is None or STATE.device is None:
-        raise HTTPException(status_code=503, detail="Model is not loaded")
+    _raise_if_model_unavailable()
 
     if not isinstance(messages, list) or len(messages) == 0:
         raise HTTPException(status_code=400, detail="messages must be a non-empty list")
@@ -1036,6 +1252,14 @@ async def chat_completions(req: Request):
             raise HTTPException(status_code=400, detail="max_tokens must be > 0")
         generation_config["max_new_tokens"] = parsed_max_tokens
 
+    score_metrics = _auto_score_metrics(pixel_values_cpu)
+    json_score_in_user = _env_bool("JSON_SCORE_IN_USER_PROMPT", False) and bool(score_metrics)
+    skip_chat_after_score = (
+        bool(score_metrics)
+        and _question_is_visual_only_placeholder(question)
+        and not json_score_in_user
+    )
+
     def _pixels_to_device(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         if t is None:
             return None
@@ -1046,21 +1270,55 @@ async def chat_completions(req: Request):
         async with STATE.lock:
             with torch.no_grad():
                 pixel_values = _pixels_to_device(pixel_values_cpu)
-                out = STATE.model.chat(
-                    str(STATE.device),
-                    STATE.tokenizer,
-                    pixel_values,
-                    question,
-                    generation_config,
-                    history=history or None,
-                    return_history=False,
+                chunks: List[str] = []
+                score_block = ""
+                if score_metrics:
+                    assert pixel_values is not None
+                    score_block, _ = _compute_score_block(
+                        pixel_values, generation_config, score_metrics
+                    )
+                    if not json_score_in_user:
+                        chunks.append(score_block)
+                question_eff = (
+                    _question_with_json_score_injection(question, score_block)
+                    if json_score_in_user and score_block
+                    else question
                 )
+                if not score_metrics:
+                    out = STATE.model.chat(
+                        str(STATE.device),
+                        STATE.tokenizer,
+                        pixel_values,
+                        question,
+                        generation_config,
+                        history=history or None,
+                        return_history=False,
+                    )
+                    if STATE.device.type == "cuda":
+                        torch.cuda.synchronize(STATE.device)
+                    return out.strip()
+                if not skip_chat_after_score:
+                    out = STATE.model.chat(
+                        str(STATE.device),
+                        STATE.tokenizer,
+                        pixel_values,
+                        question_eff,
+                        generation_config,
+                        history=history or None,
+                        return_history=False,
+                    )
+                    chunks.append(_strip_leading_hallucinated_score_tail(out.strip()))
                 if STATE.device.type == "cuda":
                     torch.cuda.synchronize(STATE.device)
-                return out.strip()
+                merged: List[str] = []
+                if chunks:
+                    merged.append(chunks[0].rstrip())
+                if len(chunks) > 1:
+                    merged.append(chunks[1].strip())
+                return "\n\n".join(s for s in merged if s).strip()
 
     if not stream:
-        text = await run_infer()
+        text = _repair_assistant_json_corruption(await run_infer())
         resp: ChatCompletionResponse = {
             "id": resp_id,
             "object": "chat.completion",
@@ -1089,30 +1347,95 @@ async def chat_completions(req: Request):
             }
         )
 
-        # True incremental streaming via transformers streamer.
+        # Score block (deterministic) + optional incremental chat via streamer; single lock like before.
         async with STATE.lock:
             pixel_values = _pixels_to_device(pixel_values_cpu)
-            streamer, gen_thread = _iter_tokens_via_streamer(question, pixel_values, generation_config, history)
-            try:
-                it = iter(streamer)
-                while True:
-                    done, piece = await asyncio.to_thread(_next_stream_chunk, it)
-                    if done:
-                        break
-                    if piece:
-                        yield _sse_event(
-                            {
-                                "id": resp_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model_name,
-                                "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}],
-                            }
+            score_block = ""
+            if score_metrics:
+                assert pixel_values is not None
+                with torch.no_grad():
+                    score_block, _ = _compute_score_block(
+                        pixel_values, generation_config, score_metrics
+                    )
+            if score_block and not json_score_in_user:
+                for line in score_block.splitlines(keepends=True):
+                    if not line:
+                        continue
+                    yield _sse_event(
+                        {
+                            "id": resp_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [{"index": 0, "delta": {"content": line}, "finish_reason": None}],
+                        }
+                    )
+
+            if score_block and not skip_chat_after_score and not json_score_in_user:
+                yield _sse_event(
+                    {
+                        "id": resp_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_name,
+                        "choices": [{"index": 0, "delta": {"content": "\n\n"}, "finish_reason": None}],
+                    }
+                )
+
+            question_eff = (
+                _question_with_json_score_injection(question, score_block)
+                if json_score_in_user and score_block
+                else question
+            )
+            if not score_metrics or not skip_chat_after_score:
+                streamer, gen_thread = _iter_tokens_via_streamer(
+                    question_eff, pixel_values, generation_config, history
+                )
+                try:
+                    it = iter(streamer)
+                    # 带自动分项时，chat 段先收齐再清洗，避免流式碎片无法去掉开头的 score() 假分块
+                    if score_metrics and not skip_chat_after_score:
+                        buf: List[str] = []
+                        while True:
+                            done, piece = await asyncio.to_thread(_next_stream_chunk, it)
+                            if done:
+                                break
+                            if piece:
+                                buf.append(piece)
+                        cleaned = _repair_assistant_json_corruption(
+                            _strip_leading_hallucinated_score_tail("".join(buf))
                         )
-            finally:
-                # Client disconnect/cancel must not release the lock while generate() still runs;
-                # otherwise the next request starts a second forward and CUDA OOMs.
-                await asyncio.to_thread(gen_thread.join)
+                        for line in cleaned.splitlines(keepends=True):
+                            if not line:
+                                continue
+                            yield _sse_event(
+                                {
+                                    "id": resp_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model_name,
+                                    "choices": [{"index": 0, "delta": {"content": line}, "finish_reason": None}],
+                                }
+                            )
+                    else:
+                        while True:
+                            done, piece = await asyncio.to_thread(_next_stream_chunk, it)
+                            if done:
+                                break
+                            if piece:
+                                yield _sse_event(
+                                    {
+                                        "id": resp_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": model_name,
+                                        "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}],
+                                    }
+                                )
+                finally:
+                    await asyncio.to_thread(gen_thread.join)
+            if STATE.device.type == "cuda":
+                torch.cuda.synchronize(STATE.device)
 
         # Final chunk
         yield _sse_event(

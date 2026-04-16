@@ -63,7 +63,10 @@ services:
       MODEL_ID: unipercept
       PORT: "8000"
       PREFER_CUDA: "true"
-      SYSTEM_PROMPT_FILE: /workspace/config/system_prompt.txt
+      # SYSTEM_PROMPT_FILE: /workspace/config/system_prompt.txt
+      SYSTEM_PROMPT_FILE: /workspace/config/system_prompt_json.txt
+      # 与 JSON 系统提示搭配：true=IAA/IQA/ISTA 先由服务端算好并附在用户消息里再 chat，回复中不再在 JSON 前重复三行分数；false=保持「三行分数\\n\\n正文」旧行为
+      JSON_SCORE_IN_USER_PROMPT: "true"
       LOAD_IN_8BIT: "true"
       LOAD_IN_4BIT: "false"
       MAX_IMAGES_PER_REQUEST: "1"
