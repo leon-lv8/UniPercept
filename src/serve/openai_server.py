@@ -615,70 +615,131 @@ def _flatten_openai_user_content(parts: List[Any], *, strip_images: bool) -> Tup
     return flat, urls
 
 
-def _role_line(role: str, content: Any, *, images_allowed: bool) -> Tuple[str, List[str]]:
-    """One message -> 'role: ...' line and image URLs (only collected for the latest user message)."""
+def _openai_text_parts(content: Any) -> str:
+    """Flatten OpenAI-style message content to plain text (system/assistant list parts)."""
     if content is None:
         raise HTTPException(status_code=400, detail="messages[].content is required")
     if isinstance(content, str):
-        return f"{role}: {content}", []
+        return content
     if isinstance(content, list):
-        flat, urls = _flatten_openai_user_content(content, strip_images=not images_allowed)
-        return f"{role}: {flat}", urls
+        bits: List[str] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text":
+                bits.append(str(part.get("text", "")))
+        return "\n".join(bits)
     raise HTTPException(status_code=400, detail="messages[].content must be a string or a non-empty array")
 
 
-def _messages_to_prompt_and_pixels(messages: List[dict]) -> Tuple[str, Optional[torch.Tensor]]:
-    """Match src/eval/conversation.py: optional pixel_values + question with <image> markers."""
-    parts: List[str] = []
-    pending_urls: List[str] = []
+def _user_message_flat(m: dict, *, images_allowed: bool) -> Tuple[str, List[str]]:
+    """User message -> (text with optional <image> markers, image URLs when images_allowed)."""
+    content = m.get("content")
+    if content is None:
+        raise HTTPException(status_code=400, detail="messages[].content is required")
+    if isinstance(content, str):
+        return content.strip(), []
+    if isinstance(content, list):
+        flat, urls = _flatten_openai_user_content(content, strip_images=not images_allowed)
+        if images_allowed and urls:
+            flat = _normalize_trailing_image_placeholder(flat, urls)
+        return flat.strip(), urls
+    raise HTTPException(status_code=400, detail="messages[].content must be a string or a non-empty array")
 
+
+def _assistant_message_flat(m: dict) -> str:
+    return _openai_text_parts(m.get("content")).strip()
+
+
+def _collect_client_system_prefix(messages: List[dict]) -> str:
+    chunks: List[str] = []
+    for m in messages:
+        if not isinstance(m, dict) or m.get("role") != "system":
+            continue
+        t = _openai_text_parts(m.get("content")).strip()
+        if t:
+            chunks.append(t)
+    return "\n\n".join(chunks).strip()
+
+
+def _prompt_chars_total(history: List[Tuple[str, str]], question: str) -> int:
+    n = len(question)
+    for u, a in history:
+        n += len(u) + len(a)
+    return n
+
+
+def _truncate_chat_for_max_chars(
+    history: List[Tuple[str, str]], question: str, max_limit: Optional[int]
+) -> Tuple[List[Tuple[str, str]], str]:
+    """Drop oldest (user, assistant) pairs first; then hard-truncate the final user question if needed."""
+    if max_limit is None or max_limit <= 0:
+        return history, question
+    hist = list(history)
+    while _prompt_chars_total(hist, question) > max_limit:
+        if hist:
+            hist.pop(0)
+            logger.info("Prompt exceeded MAX_PROMPT_TOTAL_CHARS=%s; dropped oldest chat turn.", max_limit)
+            continue
+        keep = max_limit - 48
+        question = (question[:keep] if keep > 0 else "").rstrip() + "\n... [prompt truncated by MAX_PROMPT_TOTAL_CHARS]"
+        logger.info("Prompt exceeded MAX_PROMPT_TOTAL_CHARS=%s; truncated latest user text.", max_limit)
+        break
+    return hist, question
+
+
+def _messages_to_chat_inputs(messages: List[dict]) -> Tuple[List[Tuple[str, str]], str, Optional[torch.Tensor]]:
+    """Parse OpenAI messages into InternVL chat(history, question) + pixel_values for the latest user only."""
     user_indices = [i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "user"]
-    last_user_idx = user_indices[-1] if user_indices else -1
+    if not user_indices:
+        raise HTTPException(status_code=400, detail="messages must contain at least one user message")
+    last_user_idx = user_indices[-1]
+
+    system_prefix = _collect_client_system_prefix(messages)
+    history: List[Tuple[str, str]] = []
+    pending_user: Optional[str] = None
+    first_user_seen = False
+    pending_urls: List[str] = []
 
     for i, m in enumerate(messages):
         if not isinstance(m, dict):
             continue
         role = m.get("role")
-        content = m.get("content")
         if role not in {"system", "user", "assistant"}:
             continue
-        allow_img = role == "user" and i == last_user_idx
-        line, urls = _role_line(str(role), content, images_allowed=allow_img)
-        parts.append(line)
-        if urls:
-            pending_urls.extend(urls)
+        if role == "system":
+            continue
+        if role == "user":
+            text, urls_here = _user_message_flat(m, images_allowed=(i == last_user_idx))
+            if not first_user_seen:
+                if system_prefix:
+                    text = system_prefix + ("\n\n" if text else "") + text
+                first_user_seen = True
+            if pending_user is None:
+                pending_user = text
+            else:
+                pending_user = pending_user + "\n\n" + text
+            if i == last_user_idx:
+                pending_urls = urls_here
+        else:
+            if pending_user is None:
+                raise HTTPException(status_code=400, detail="assistant message before any user message")
+            history.append((pending_user, _assistant_message_flat(m)))
+            pending_user = None
 
-    user_lines = [p for p in parts if p.startswith("user:")]
-    sys_lines = [p for p in parts if p.startswith("system:")]
-    assistant_lines = [p for p in parts if p.startswith("assistant:")]
+    if pending_user is None:
+        raise HTTPException(status_code=400, detail="messages must end with a user message")
 
-    prompt_chunks: List[str] = []
-    if sys_lines:
-        prompt_chunks.append("\n".join(sys_lines))
-    if assistant_lines or len(user_lines) > 1:
-        prompt_chunks.append("\n".join([*user_lines[:-1], *assistant_lines]))
-    if not user_lines:
-        raise HTTPException(status_code=400, detail="messages must contain at least one user message")
-    last_user_text = user_lines[-1].removeprefix("user: ").strip()
-    if not last_user_text and not pending_urls:
+    last_question = pending_user
+
+    if not last_question.strip() and not pending_urls:
         raise HTTPException(
             status_code=400,
             detail="Latest user message must include non-empty text or at least one image_url with a non-empty URL",
         )
-    prompt_chunks.append(last_user_text)
-    prompt = "\n".join([c for c in prompt_chunks if c.strip()])
 
     max_prompt_limit = _max_prompt_total_chars()
-    if max_prompt_limit is not None and len(prompt) > max_prompt_limit:
-        slim_chunks: List[str] = []
-        if sys_lines:
-            slim_chunks.append("\n".join(sys_lines))
-        slim_chunks.append(last_user_text)
-        prompt = "\n".join([c for c in slim_chunks if c.strip()])
-        if len(prompt) > max_prompt_limit:
-            keep = max_prompt_limit - 48
-            prompt = (prompt[:keep] if keep > 0 else "").rstrip() + "\n... [prompt truncated by MAX_PROMPT_TOTAL_CHARS]"
-        logger.info("Prompt exceeded MAX_PROMPT_TOTAL_CHARS=%s; dropped middle chat history.", max_prompt_limit)
+    history, last_question = _truncate_chat_for_max_chars(history, last_question, max_prompt_limit)
 
     pixel_values_cpu: Optional[torch.Tensor] = None
     if pending_urls:
@@ -695,11 +756,15 @@ def _messages_to_prompt_and_pixels(messages: List[dict]) -> Tuple[str, Optional[
             pixel_values_cpu = _load_stacked_pixel_values_cpu(pending_urls)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
-    return prompt, pixel_values_cpu
+    return history, last_question, pixel_values_cpu
 
 
-def _tokenized_inputs_for_question(question: str, pixel_values: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, int]:
-    """Align with InternVLChatModel.chat() tokenization (incl. <image> -> visual token span)."""
+def _tokenized_inputs_for_chat(
+    question: str,
+    pixel_values: Optional[torch.Tensor],
+    history: List[Tuple[str, str]],
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    """Match InternVLChatModel.chat() tokenization including multi-turn history."""
     tokenizer = STATE.tokenizer
     model = STATE.model
     device = STATE.device
@@ -720,6 +785,9 @@ def _tokenized_inputs_for_question(question: str, pixel_values: Optional[torch.T
     template.system_message = getattr(model, "system_message", template.system_message)
     eos_token_id = tokenizer.convert_tokens_to_ids(template.sep.strip())
 
+    for old_q, old_a in history:
+        template.append_message(template.roles[0], old_q)
+        template.append_message(template.roles[1], old_a)
     template.append_message(template.roles[0], question)
     template.append_message(template.roles[1], None)
     query = template.get_prompt()
@@ -775,15 +843,60 @@ class _State:
 
 STATE = _State()
 
+
+def _merge_request_generation_config(body: ChatCompletionRequest) -> Dict[str, Any]:
+    """Start from STATE.gen_cfg, then apply OpenAI-style per-request sampling overrides."""
+    if STATE.gen_cfg is None or STATE.device is None:
+        raise HTTPException(status_code=503, detail="Model is not loaded")
+    cfg: Dict[str, Any] = dict(STATE.gen_cfg)
+    greedy_forced = False
+    temp_explicit = "temperature" in body and body.get("temperature") is not None
+
+    if temp_explicit:
+        try:
+            t = float(body["temperature"])  # type: ignore[arg-type]
+        except (TypeError, ValueError) as e:
+            raise HTTPException(status_code=400, detail="temperature must be a number") from e
+        if t <= 0:
+            cfg["do_sample"] = False
+            greedy_forced = True
+            cfg.pop("temperature", None)
+            cfg.pop("top_p", None)
+        else:
+            cfg["do_sample"] = True
+            cfg["temperature"] = t
+
+    if "top_p" in body and body.get("top_p") is not None and not greedy_forced:
+        try:
+            tp = float(body["top_p"])  # type: ignore[arg-type]
+        except (TypeError, ValueError) as e:
+            raise HTTPException(status_code=400, detail="top_p must be a number") from e
+        cfg["top_p"] = tp
+        if tp < 1.0 and not temp_explicit:
+            cfg["do_sample"] = True
+
+    if "seed" in body and body.get("seed") is not None:
+        try:
+            sd = int(body["seed"])  # type: ignore[arg-type]
+        except (TypeError, ValueError) as e:
+            raise HTTPException(status_code=400, detail="seed must be an integer") from e
+        gen = torch.Generator(device=STATE.device)
+        gen.manual_seed(sd & 0xFFFFFFFF)
+        cfg["generator"] = gen
+
+    return {k: v for k, v in cfg.items() if v is not None}
+
+
 def _iter_tokens_via_streamer(
     question: str,
     pixel_values: Optional[torch.Tensor],
     generation_config: Dict[str, Any],
+    history: List[Tuple[str, str]],
 ) -> Tuple["TextIteratorStreamer", Thread]:
     if STATE.model is None or STATE.tokenizer is None or STATE.gen_cfg is None or STATE.device is None:
         raise RuntimeError("Model is not loaded")
 
-    input_ids, attention_mask, eos_token_id = _tokenized_inputs_for_question(question, pixel_values)
+    input_ids, attention_mask, eos_token_id = _tokenized_inputs_for_chat(question, pixel_values, history)
 
     streamer = TextIteratorStreamer(
         STATE.tokenizer,
@@ -902,7 +1015,7 @@ async def chat_completions(req: Request):
         raise HTTPException(status_code=400, detail="messages must be a non-empty list")
 
     try:
-        prompt, pixel_values_cpu = await asyncio.to_thread(_messages_to_prompt_and_pixels, messages)
+        history, question, pixel_values_cpu = await asyncio.to_thread(_messages_to_chat_inputs, messages)
     except HTTPException:
         raise
     except Exception as e:
@@ -910,7 +1023,10 @@ async def chat_completions(req: Request):
 
     created = _now_ts()
     resp_id = f"chatcmpl-{uuid.uuid4().hex}"
-    generation_config = dict(STATE.gen_cfg)
+    try:
+        generation_config = _merge_request_generation_config(body)
+    except HTTPException:
+        raise
     if request_max_tokens is not None:
         try:
             parsed_max_tokens = int(request_max_tokens)
@@ -934,9 +1050,9 @@ async def chat_completions(req: Request):
                     str(STATE.device),
                     STATE.tokenizer,
                     pixel_values,
-                    prompt,
+                    question,
                     generation_config,
-                    history=None,
+                    history=history or None,
                     return_history=False,
                 )
                 if STATE.device.type == "cuda":
@@ -976,7 +1092,7 @@ async def chat_completions(req: Request):
         # True incremental streaming via transformers streamer.
         async with STATE.lock:
             pixel_values = _pixels_to_device(pixel_values_cpu)
-            streamer, gen_thread = _iter_tokens_via_streamer(prompt, pixel_values, generation_config)
+            streamer, gen_thread = _iter_tokens_via_streamer(question, pixel_values, generation_config, history)
             try:
                 it = iter(streamer)
                 while True:

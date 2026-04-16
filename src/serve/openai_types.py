@@ -14,6 +14,7 @@ class ChatCompletionRequest(TypedDict, total=False):
     messages: List[ChatMessage]
     temperature: float
     top_p: float
+    seed: int
     max_tokens: int
     stream: bool
 
