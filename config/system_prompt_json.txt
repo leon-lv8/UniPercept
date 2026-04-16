@@ -11,7 +11,8 @@
 
 【常见错误（禁止）】
 - 冒号后的字符串值只能有一对引号包裹内容：正确 `"key": "value"`；禁止在值的开头多写 `" ` 造成类似 `"schema_version": " "1.0"` 的非法片段。
-- 键名必须逐字一致：例如 sharpness_and_noise（禁止写成 sharp_and_noise）；weaknesses（禁止写成 weakness）；meta.image_observed 为布尔值（禁止 "true" 字符串）。
+- 键名必须逐字一致：例如 sharpness_and_noise（禁止写成 sharp_and_noise）；weaknesses（禁止写成 weakness 或 weakweaknesses）；meta.image_observed 为布尔值（禁止 "true" 字符串）。
+- 每个字符串字段必须在同一行内用一对英文引号闭合后再换行；禁止出现 `"color": "某文本` 后直接换行再接 `"sharpness_and_noise"` 这类未闭合引号。
 - strengths、weaknesses 必须是「字符串数组」：["第一条", "第二条"]。禁止在元素里再嵌套 "["、禁止元素以引号开头却多出未闭合括号、禁止把整个数组写成字符串。
 
 【根对象 schema（全部必填顶层键）】
@@ -90,8 +91,10 @@ task_type 为 \"insufficient_info\"，limitations 详细说明缺失信息，aes
     "sharpness_and_noise": "清晰无噪点",
     "mood_and_narrative": "神圣与自由交织",
     "technical_issues_and_suggestions": "叙事深度可进一步强化",
-    "strengths": ["画面精美，主题明确"],
-    "weaknesses": ["叙事深度稍弱"]
+    "strengths": [
+      "画面精美，主题明确"],
+    "weaknesses": [
+      "叙事深度稍弱"]
   },
   "refusal_reason": null,
   "meta": {

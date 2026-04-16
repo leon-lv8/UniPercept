@@ -995,6 +995,30 @@ def _repair_assistant_json_corruption(text: str) -> str:
 
     def _apply_heuristic_fixes(blob: str) -> str:
         t = blob
+        t = t.replace('"weakweaknesses":', '"weaknesses":')
+        t = t.replace('"weakweaknesses" :', '"weaknesses":')
+        # Unclosed string on one line immediately before next aesthetic key on the following line.
+        _ae_str_keys = (
+            "subject_and_content",
+            "composition",
+            "lighting",
+            "color",
+            "sharpness_and_noise",
+            "mood_and_narrative",
+            "technical_issues_and_suggestions",
+        )
+        for a, b in zip(_ae_str_keys, _ae_str_keys[1:]):
+            pat = rf'("{re.escape(a)}"\s*:\s*")([^\n]+)(\n\s*"{re.escape(b)}"\s*:)'
+
+            def _close_prev(m: re.Match[str]) -> str:
+                pre, mid, suf = m.group(1), m.group(2), m.group(3)
+                tail = mid.rstrip()
+                # 已正常闭合：…" 结尾，或 …", 结尾（引号在逗号前）
+                if tail.endswith('",') or tail.endswith('"'):
+                    return m.group(0)
+                return f'{pre}{mid}",{suf}'
+
+            t = re.sub(pat, _close_prev, t)
         prev = None
         while prev != t:
             prev = t
