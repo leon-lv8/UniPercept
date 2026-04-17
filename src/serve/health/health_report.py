@@ -251,7 +251,44 @@ _HEALTH_AUTO_REFRESH_SCRIPT = """<script>
   var cb = document.getElementById("arOn");
   var inp = document.getElementById("arSec");
   var meta = document.getElementById("arMeta");
-  var timer = null, cd = 0;
+  var timer = null, cd = 0, fetchCtl = null, fetchGen = 0;
+  var partialUrl = "/health?format=json&partial=1";
+  function tickFetch() {
+    clearT();
+    var myGen = ++fetchGen;
+    if (fetchCtl) { try { fetchCtl.abort(); } catch (e0) {} }
+    fetchCtl = new AbortController();
+    if (meta) meta.textContent = "刷新中…";
+    if (inp) inp.disabled = true;
+    fetch(partialUrl, {
+      method: "GET",
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+      signal: fetchCtl.signal
+    })
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+      .then(function (data) {
+        var ui = data._health_ui;
+        if (ui && window.__uniHealthApplyPartial) window.__uniHealthApplyPartial(ui);
+      })
+      .catch(function (e) {
+        if (e.name === "AbortError") return;
+        if (meta) meta.textContent = "刷新失败: " + (e.message || String(e));
+      })
+      .finally(function () {
+        if (myGen !== fetchGen) return;
+        fetchCtl = null;
+        if (inp) inp.disabled = false;
+        if (!cb || !inp || !cb.checked) { metaTxt(); return; }
+        cd = clamp(inp.value);
+        metaTxt();
+        timer = setInterval(function () {
+          cd -= 1;
+          if (cd <= 0) { tickFetch(); return; }
+          metaTxt();
+        }, 1000);
+      });
+  }
   function loadOn() {
     try { var v = localStorage.getItem(K_ON); if (v === null) return false; return v === "1" || v === "true"; }
     catch (e) { return false; }
@@ -278,7 +315,7 @@ _HEALTH_AUTO_REFRESH_SCRIPT = """<script>
     metaTxt();
     timer = setInterval(function () {
       cd -= 1;
-      if (cd <= 0) { clearT(); location.reload(); return; }
+      if (cd <= 0) { tickFetch(); return; }
       metaTxt();
     }, 1000);
   }
@@ -335,7 +372,30 @@ def _health_desc_help(node: Any) -> str:
     return ""
 
 
-def _health_html_page(
+def _health_ts_hms_from_full(ts: str) -> str:
+    """从「YYYY-MM-DD HH:MM:SS」取时分秒；异常时退回当前时间。"""
+    if len(ts) >= 19 and ts[10] == " ":
+        return ts[11:19]
+    return time.strftime("%H:%M:%S", time.localtime())
+
+
+def _health_html_cell(x: Any) -> str:
+    if x is None:
+        return "—"
+    return html.escape(str(x), quote=False)
+
+
+def _health_html_row_zh(label_zh: str, desc_zh: str, val: Any) -> str:
+    lh = html.escape(label_zh, quote=False)
+    dh = html.escape(desc_zh, quote=False) if desc_zh else ""
+    return (
+        f'<tr><th scope="row"><span class="lbl">{lh}</span>'
+        f'<div class="desc">{dh}</div></th>'
+        f'<td class="val">{_health_html_cell(val)}</td></tr>'
+    )
+
+
+def _health_render_dynamic_rows(
     out: Dict[str, Any],
     *,
     model_path: str = "",
@@ -343,25 +403,8 @@ def _health_html_page(
     page_generated_at: str = "",
     cuda_available: Optional[bool] = None,
     cuda_device_name: Optional[str] = None,
-) -> str:
-    """浏览器健康页：中文名称与说明，含推理配置与完整 GPU 列。"""
-    plain = _unwrap_described(out)
-    safe_json = html.escape(json.dumps(plain, ensure_ascii=False, indent=2), quote=False)
-
-    def cell(x: Any) -> str:
-        if x is None:
-            return "—"
-        return html.escape(str(x), quote=False)
-
-    def row_zh(label_zh: str, desc_zh: str, val: Any) -> str:
-        lh = html.escape(label_zh, quote=False)
-        dh = html.escape(desc_zh, quote=False) if desc_zh else ""
-        return (
-            f'<tr><th scope="row"><span class="lbl">{lh}</span>'
-            f'<div class="desc">{dh}</div></th>'
-            f'<td class="val">{cell(val)}</td></tr>'
-        )
-
+) -> Tuple[str, str, str, str, str]:
+    """生成可替换的 tbody 行 HTML 与底部 JSON（已 HTML escape）。"""
     main_keys = [
         "status",
         "model_loaded",
@@ -381,51 +424,51 @@ def _health_html_page(
         node = out[key]
         lbl = _HEALTH_HTML_LABELS.get(key, key)
         hint = _health_desc_help(node) or _HEALTH_TOP_DESC.get(key, "")
-        tr_main += row_zh(lbl, hint, _health_desc_value(node))
+        tr_main += _health_html_row_zh(lbl, hint, _health_desc_value(node))
 
     if model_path:
-        tr_main += row_zh(
+        tr_main += _health_html_row_zh(
             "模型权重路径",
             "来自环境变量 MODEL_PATH，指向本服务加载的权重目录。",
             model_path,
         )
     if max_new_tokens_effective is not None:
-        tr_main += row_zh(
+        tr_main += _health_html_row_zh(
             "默认单次最大生成长度",
             "对应生成配置中的 max_new_tokens；客户端仍可在请求里用 max_tokens 覆盖。",
             max_new_tokens_effective,
         )
     if page_generated_at:
-        tr_main += row_zh(
+        tr_main += _health_html_row_zh(
             "本页生成时间",
             "服务端本地时间，用于判断信息新鲜度。",
             page_generated_at,
         )
     if cuda_available is not None:
-        tr_main += row_zh(
+        tr_main += _health_html_row_zh(
             "PyTorch 可见 CUDA",
             "torch.cuda.is_available() 的查询结果。",
             "是" if cuda_available else "否",
         )
     if cuda_device_name:
-        tr_main += row_zh(
+        tr_main += _health_html_row_zh(
             "CUDA 设备名称",
             "torch.cuda.get_device_name 返回的当前索引对应 GPU 名称。",
             cuda_device_name,
         )
-    tr_main += row_zh(
+    tr_main += _health_html_row_zh(
         "PyTorch 版本",
         "当前进程内已加载的 torch 软件包版本。",
         getattr(torch, "__version__", "—"),
     )
-    tr_main += row_zh(
+    tr_main += _health_html_row_zh(
         "Python 版本",
         "运行本服务的解释器主、次、修订版本号。",
         f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
     )
 
     tr_gpu_meta = ""
-    devices: List[Any] = []  # nvidia-smi device rows
+    devices: List[Any] = []
     gpu_block = out.get("gpu")
     gv = _health_desc_value(gpu_block) if gpu_block is not None else None
     if isinstance(gv, dict):
@@ -435,31 +478,22 @@ def _health_html_page(
             sn = gv[subk]
             lbl = _GPU_SUB_HTML_LABELS.get(subk, subk)
             hint = _health_desc_help(sn) or _GPU_SECTION_DESC.get(subk, "")
-            tr_gpu_meta += row_zh(lbl, hint, _health_desc_value(sn))
+            tr_gpu_meta += _health_html_row_zh(lbl, hint, _health_desc_value(sn))
         dev_node = gv.get("devices")
         raw_dev = _health_desc_value(dev_node)
         if isinstance(raw_dev, list):
             devices = raw_dev
 
-    hdr_cells = []
-    for k in _NVIDIA_SMI_FIELD_KEYS_DISPLAY:
-        lbl = _NVIDIA_SMI_FIELD_LABELS_ZH.get(k, k)
-        dsc = _NVIDIA_SMI_LEAF_DESC.get(k, "")
-        hdr_cells.append(
-            f'<th><span class="lbl">{html.escape(lbl, quote=False)}</span>'
-            f'<div class="desc">{html.escape(dsc, quote=False)}</div></th>'
-        )
-    hdr_gpu = "".join(hdr_cells)
-    body_gpu = ""
     ncol = len(_NVIDIA_SMI_FIELD_KEYS_DISPLAY)
+    body_gpu = ""
     if devices:
         for d in devices:
             if not isinstance(d, dict):
-                body_gpu += f'<tr><td class="val" colspan="{ncol}">{cell(d)}</td></tr>'
+                body_gpu += f'<tr><td class="val" colspan="{ncol}">{_health_html_cell(d)}</td></tr>'
                 continue
             tds = []
             for k in _NVIDIA_SMI_FIELD_KEYS_DISPLAY:
-                tds.append(f'<td class="val">{cell(_health_desc_value(d.get(k)))}</td>')
+                tds.append(f'<td class="val">{_health_html_cell(_health_desc_value(d.get(k)))}</td>')
             body_gpu += "<tr>" + "".join(tds) + "</tr>"
     else:
         body_gpu = f'<tr><td class="val" colspan="{ncol}">无可用设备或 nvidia-smi 查询失败</td></tr>'
@@ -472,7 +506,7 @@ def _health_html_page(
             node = pv[key]
             lbl = _INFERENCE_PROFILE_LABELS_ZH.get(key, key)
             hint = _health_desc_help(node) or _INFERENCE_PROFILE_DESC.get(key, "")
-            tr_prof += row_zh(lbl, hint, _health_desc_value(node))
+            tr_prof += _health_html_row_zh(lbl, hint, _health_desc_value(node))
     else:
         tr_prof = (
             '<tr><th scope="row"><span class="lbl">说明</span>'
@@ -480,76 +514,13 @@ def _health_html_page(
             '<td class="val">—</td></tr>'
         )
 
-    # f-string 的 {{}} 表达式内不能含反斜杠转义；fallback 单独定义。
-    _gpu_meta_empty_row = '<tr><td class="val" colspan="2">—</td></tr>'
-
-    return f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>UniPercept · 健康检查</title>
-  <style>
-    body {{ font-family: system-ui, sans-serif; margin: 1.5rem; background: #0f1419; color: #e6edf3; }}
-    h1 {{ font-size: 1.25rem; font-weight: 600; margin: 0 0 1rem; }}
-    h2 {{ font-size: 1rem; font-weight: 600; margin: 1.25rem 0 0.5rem; color: #c9d1d9; }}
-    table {{ border-collapse: collapse; width: 100%; max-width: 56rem; margin-bottom: 1rem; }}
-    th, td {{ text-align: left; padding: 0.45rem 0.55rem; border-bottom: 1px solid #30363d; vertical-align: top; }}
-    th {{ width: 13rem; color: #8b949e; font-weight: 500; }}
-    .lbl {{ display: block; color: #c9d1d9; }}
-    .desc {{ font-size: 0.72rem; color: #7d8590; margin-top: 0.25rem; line-height: 1.35; max-width: 22rem; }}
-    .val {{ color: #e6edf3; }}
-    caption {{ text-align: left; font-size: 0.85rem; color: #8b949e; margin-bottom: 0.35rem; }}
-    .scroll-x {{ overflow-x: auto; max-width: 100%; margin-bottom: 1rem; }}
-    .tbl-wide th {{ min-width: 6.5rem; width: auto; }}
-    pre {{ background: #161b22; padding: 1rem; border-radius: 6px; overflow: auto; max-width: 56rem;
-           font-size: 0.78rem; line-height: 1.45; border: 1px solid #30363d; }}
-    .hint {{ font-size: 0.8rem; color: #8b949e; margin-top: 1rem; max-width: 56rem; line-height: 1.45; }}
-    code {{ font-size: 0.85em; background: #21262d; padding: 0.1rem 0.35rem; border-radius: 4px; }}
-    .refresh-bar {{ display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem 1.25rem; margin: 0 0 1.25rem;
-      padding: 0.65rem 0.85rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; max-width: 56rem; }}
-    .refresh-bar label {{ display: inline-flex; align-items: center; gap: 0.45rem; font-size: 0.88rem; color: #c9d1d9; cursor: pointer; }}
-    .refresh-bar input[type="number"] {{
-      width: 5rem; padding: 0.25rem 0.4rem; border-radius: 4px; border: 1px solid #30363d; background: #0d1117; color: #e6edf3; }}
-    .refresh-meta {{ font-size: 0.78rem; color: #8b949e; }}
-  </style>
-</head>
-<body>
-  <h1>UniPercept 服务健康检查</h1>
-  <div class="refresh-bar" id="refreshBar">
-    <label><input type="checkbox" id="arOn"/> 自动刷新页面</label>
-    <label>刷新间隔（秒）<input type="number" id="arSec" min="3" max="3600" step="1" value="30"/></label>
-    <span class="refresh-meta" id="arMeta"></span>
-  </div>
-  <table>
-    <caption>服务与模型概要</caption>
-    <tbody>{tr_main}</tbody>
-  </table>
-  <h2>GPU 查询结果</h2>
-  <table>
-    <caption>nvidia-smi 概要</caption>
-    <tbody>{tr_gpu_meta or _gpu_meta_empty_row}</tbody>
-  </table>
-  <div class="scroll-x">
-    <table class="tbl-wide">
-      <caption>GPU 设备明细（各列含义见表头下方说明）</caption>
-      <thead><tr>{hdr_gpu}</tr></thead>
-      <tbody>{body_gpu}</tbody>
-    </table>
-  </div>
-  <h2>推理与视觉配置</h2>
-  <table>
-    <caption>与当前加载模型相关的关键参数</caption>
-    <tbody>{tr_prof}</tbody>
-  </table>
-  <p class="hint">自动刷新开关与间隔（秒）保存在浏览器 <code>localStorage</code>；也可用 <code>?ar=1&amp;ar_sec=15</code> 在打开页面时临时指定是否开启与间隔。下方为与 JSON 接口一致的<strong>完整原始数据</strong>（字段名为英文，便于脚本解析）。若只要 JSON 响应，请使用请求头 <code>Accept: application/json</code> 或查询参数 <code>?format=json</code>。</p>
-  <pre>{safe_json}</pre>
-{_HEALTH_AUTO_REFRESH_SCRIPT}
-</body>
-</html>"""
+    plain = _unwrap_described(out)
+    safe_json = html.escape(json.dumps(plain, ensure_ascii=False, indent=2), quote=False)
+    return tr_main, tr_gpu_meta, body_gpu, tr_prof, safe_json
 
 
-async def health(request: Request):
+async def _health_build_out(request: Request) -> Dict[str, Any]:
+    """组装 /health 的 described 载荷（HTML 与 JSON 共用）。"""
     ok_smi, smi_err, gpu_devices = await asyncio.to_thread(_nvidia_smi_gpu_devices)
     prof = _inference_profile_snapshot()
     mem_used_mib = None
@@ -583,8 +554,503 @@ async def health(request: Request):
     }
     if prof:
         out["inference_profile"] = _described(_wrap_inference_profile(prof), _HEALTH_TOP_DESC["inference_profile"])
-    if _health_wants_json(request):
-        return JSONResponse(out)
+    return out
+
+
+_HEALTH_CHART_DEVICE_KEYS = (
+    "index",
+    "temperature_gpu_c",
+    "utilization_gpu_pct",
+    "memory_used_mib",
+    "power_draw_w",
+)
+
+_HEALTH_CHART_METRICS: Tuple[Tuple[str, str, str], ...] = (
+    ("temperature_gpu_c", "chGpuTemp", "核心温度 (°C)"),
+    ("utilization_gpu_pct", "chGpuUtil", "GPU 利用率 (%)"),
+    ("memory_used_mib", "chGpuMemUtil", "GPU 显存已用 (MiB)"),
+    ("power_draw_w", "chGpuPower", "当前功耗 (W)"),
+)
+
+_HEALTH_GPU_SERIES_STORAGE_KEY = "unipercept_health_gpu_series_v2"
+_HEALTH_GPU_SERIES_MAX_POINTS = 120
+
+_CHART_JS_BOOTCDN = "https://cdn.bootcdn.net/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"
+_CHART_JS_STATICFILE = "https://cdn.staticfile.org/Chart.js/4.4.1/chart.umd.min.js"
+
+
+def _health_chart_seed(plain: Dict[str, Any], page_generated_at: str) -> Dict[str, Any]:
+    devices_out: List[Dict[str, Any]] = []
+    gpu = plain.get("gpu")
+    if isinstance(gpu, dict):
+        raw = gpu.get("devices")
+        if isinstance(raw, list):
+            for d in raw:
+                if not isinstance(d, dict):
+                    continue
+                row: Dict[str, Any] = {}
+                for k in _HEALTH_CHART_DEVICE_KEYS:
+                    row[k] = d.get(k)
+                devices_out.append(row)
+    ts = page_generated_at or ""
+    return {
+        "ts": ts,
+        "ts_hms": _health_ts_hms_from_full(ts) if ts else time.strftime("%H:%M:%S", time.localtime()),
+        "devices": devices_out,
+    }
+
+
+def _health_ui_payload(
+    out: Dict[str, Any],
+    *,
+    model_path: str = "",
+    max_new_tokens_effective: Any = None,
+    page_generated_at: str = "",
+    cuda_available: Optional[bool] = None,
+    cuda_device_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """供 GET /health?format=json&partial=1 的 _health_ui 字段：表格片段 + chart_seed。"""
+    tr_main, tr_gpu_meta, body_gpu, tr_prof, safe_json = _health_render_dynamic_rows(
+        out,
+        model_path=model_path,
+        max_new_tokens_effective=max_new_tokens_effective,
+        page_generated_at=page_generated_at,
+        cuda_available=cuda_available,
+        cuda_device_name=cuda_device_name,
+    )
+    _gpu_meta_empty_row = '<tr><td class="val" colspan="2">—</td></tr>'
+    gpu_meta_html = tr_gpu_meta if tr_gpu_meta.strip() else _gpu_meta_empty_row
+    plain = _unwrap_described(out)
+    return {
+        "page_generated_at": page_generated_at,
+        "fragments": {
+            "main_tbody": tr_main,
+            "gpu_meta_tbody": gpu_meta_html,
+            "gpu_device_tbody": body_gpu,
+            "profile_tbody": tr_prof,
+            "safe_json_pre": safe_json,
+        },
+        "chart_seed": _health_chart_seed(plain, page_generated_at),
+    }
+
+
+def _health_json_for_embedded_script(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False).replace("<", "\\u003c")
+
+
+_HEALTH_GPU_CHARTS_JS = """
+(function () {
+  var STORAGE = "__STORAGE_KEY__";
+  var MAX = __MAX_POINTS__;
+  var METRICS = __METRICS_JSON__;
+  var chartRefs = [];
+  function parseSeed() {
+    var el = document.getElementById("uniperceptHealthChartSeed");
+    if (!el || !el.textContent) return null;
+    try { return JSON.parse(el.textContent); } catch (e) { return null; }
+  }
+  function readSeries() {
+    try {
+      var raw = sessionStorage.getItem(STORAGE);
+      if (!raw) return { points: [] };
+      var o = JSON.parse(raw);
+      if (!o || !Array.isArray(o.points)) return { points: [] };
+      return o;
+    } catch (e) { return { points: [] }; }
+  }
+  function writeSeries(obj) {
+    try { sessionStorage.setItem(STORAGE, JSON.stringify(obj)); } catch (e) {}
+  }
+  function metricAt(point, gpuIndex, key) {
+    var devs = point.devices || [];
+    var d = null;
+    for (var i = 0; i < devs.length; i++) {
+      if (Number(devs[i].index) === gpuIndex) { d = devs[i]; break; }
+    }
+    if (!d && devs.length) d = devs[0];
+    if (!d) return null;
+    var v = d[key];
+    if (v === null || v === undefined) return null;
+    var n = Number(v);
+    return isNaN(n) ? null : n;
+  }
+  function collectGpuIndices(points) {
+    var s = {};
+    for (var i = 0; i < points.length; i++) {
+      var devs = points[i].devices || [];
+      for (var j = 0; j < devs.length; j++) {
+        var ix = devs[j].index;
+        if (ix !== undefined && ix !== null) s[String(ix)] = Number(ix);
+      }
+    }
+    var out = [];
+    for (var k in s) if (Object.prototype.hasOwnProperty.call(s, k)) out.push(s[k]);
+    out.sort(function (a, b) { return a - b; });
+    return out;
+  }
+  function formatMetricLatest(key, n) {
+    if (n === null || n === undefined) return "—";
+    if (typeof n !== "number" || isNaN(n)) return "—";
+    if (key === "power_draw_w") {
+      var x = Math.round(n * 10) / 10;
+      return x % 1 === 0 ? String(Math.round(x)) : x.toFixed(1);
+    }
+    return String(Math.round(n));
+  }
+  function latestMetricSuffix(pts, indices, key) {
+    if (!pts || !pts.length) return null;
+    var last = pts[pts.length - 1];
+    var parts = [];
+    for (var g = 0; g < indices.length; g++) {
+      var gi = indices[g];
+      var v = metricAt(last, gi, key);
+      var s = formatMetricLatest(key, v);
+      parts.push(indices.length > 1 ? "GPU " + gi + "：" + s : s);
+    }
+    return parts.join(" · ");
+  }
+  function updateChartCardTitles(pts) {
+    var indices = collectGpuIndices(pts);
+    if (!indices.length) indices = [0];
+    for (var m = 0; m < METRICS.length; m++) {
+      var key = METRICS[m][0], canvasId = METRICS[m][1], base = METRICS[m][2];
+      var h3 = document.getElementById("health-chart-title-" + canvasId);
+      if (!h3) {
+        var el = document.getElementById(canvasId);
+        if (el && el.closest) {
+          var card = el.closest(".chart-card");
+          if (card) h3 = card.querySelector("h3");
+        }
+      }
+      if (!h3) continue;
+      var attrBase = h3.getAttribute("data-base-title");
+      if (attrBase) base = attrBase;
+      var sfx = latestMetricSuffix(pts, indices, key);
+      h3.textContent = sfx ? base + "：" + sfx : base;
+    }
+  }
+  var PALETTE = ["#58a6ff", "#d2a8ff", "#79c0ff", "#ffa657", "#7ee787", "#ff7b72"];
+  function chartTextDefaults() {
+    return { color: "#8b949e", font: { size: 11 } };
+  }
+  function labelHms(p) {
+    if (!p) return "—";
+    if (p.ts_hms) return p.ts_hms;
+    var ts = p.ts || "";
+    if (ts.length >= 19 && ts.charAt(10) === " ") return ts.slice(11, 19);
+    return ts || "—";
+  }
+  function normalizeSeed(seed) {
+    if (!seed) return null;
+    var ts = seed.ts || "";
+    var ts_hms = seed.ts_hms;
+    if (!ts_hms && ts.length >= 19 && ts.charAt(10) === " ") ts_hms = ts.slice(11, 19);
+    if (!ts_hms) ts_hms = "";
+    return { ts: ts, ts_hms: ts_hms, devices: seed.devices || [] };
+  }
+  function mergePointDedupe(seedNorm) {
+    var bag = readSeries();
+    var pts = bag.points || [];
+    var last = pts.length ? pts[pts.length - 1] : null;
+    if (last && last.ts === seedNorm.ts) {
+      last.ts_hms = seedNorm.ts_hms;
+      last.devices = seedNorm.devices;
+    } else {
+      pts.push({ ts: seedNorm.ts, ts_hms: seedNorm.ts_hms, devices: seedNorm.devices });
+    }
+    if (pts.length > MAX) pts = pts.slice(-MAX);
+    bag.points = pts;
+    writeSeries(bag);
+    return pts;
+  }
+  function destroyCharts() {
+    chartRefs.forEach(function (c) {
+      try { if (c) c.destroy(); } catch (e) {}
+    });
+    chartRefs = [];
+  }
+  function buildLabels(pts) {
+    return pts.map(labelHms);
+  }
+  function createChartsFromPoints(pts) {
+    if (typeof Chart === "undefined") return;
+    Chart.defaults.color = "#8b949e";
+    Chart.defaults.borderColor = "#30363d";
+    destroyCharts();
+    var labels = buildLabels(pts);
+    var indices = collectGpuIndices(pts);
+    if (!indices.length) indices = [0];
+    for (var m = 0; m < METRICS.length; m++) {
+      var key = METRICS[m][0], canvasId = METRICS[m][1];
+      var el = document.getElementById(canvasId);
+      if (!el) { chartRefs.push(null); continue; }
+      var sets = [];
+      for (var g = 0; g < indices.length; g++) {
+        var gi = indices[g];
+        var data = [];
+        for (var i = 0; i < pts.length; i++) {
+          data.push(metricAt(pts[i], gi, key));
+        }
+        sets.push({
+          label: "GPU " + gi,
+          data: data,
+          borderColor: PALETTE[g % PALETTE.length],
+          backgroundColor: "transparent",
+          tension: 0.15,
+          spanGaps: false,
+          pointRadius: 2
+        });
+      }
+      var title = METRICS[m][2];
+      var ch = new Chart(el, {
+        type: "line",
+        data: { labels: labels, datasets: sets },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: { labels: { color: "#c9d1d9" } },
+            title: { display: true, text: title, color: "#c9d1d9", font: { size: 13, weight: "600" } }
+          },
+          scales: {
+            x: { ticks: chartTextDefaults(), grid: { color: "#30363d" } },
+            y: { beginAtZero: true, ticks: chartTextDefaults(), grid: { color: "#30363d" } }
+          }
+        }
+      });
+      chartRefs.push(ch);
+    }
+    updateChartCardTitles(pts);
+  }
+  function incrementalUpdateCharts(pts) {
+    if (typeof Chart === "undefined") return;
+    var indices = collectGpuIndices(pts);
+    if (!indices.length) indices = [0];
+    var labels = buildLabels(pts);
+    if (!chartRefs.length || !chartRefs[0]) {
+      createChartsFromPoints(pts);
+      return;
+    }
+    if (chartRefs[0].data.datasets.length !== indices.length) {
+      createChartsFromPoints(pts);
+      return;
+    }
+    for (var m = 0; m < METRICS.length; m++) {
+      var ch = chartRefs[m];
+      if (!ch) continue;
+      var key = METRICS[m][0];
+      ch.data.labels = labels.slice();
+      for (var g = 0; g < indices.length; g++) {
+        var gi = indices[g];
+        var data = [];
+        for (var i = 0; i < pts.length; i++) {
+          data.push(metricAt(pts[i], gi, key));
+        }
+        if (ch.data.datasets[g]) ch.data.datasets[g].data = data;
+      }
+      ch.update("none");
+    }
+    updateChartCardTitles(pts);
+  }
+  window.__uniHealthAppendChartSeed = function (seed) {
+    var n = normalizeSeed(seed);
+    if (!n || !n.ts) return;
+    var pts = mergePointDedupe(n);
+    incrementalUpdateCharts(pts);
+  };
+  window.__uniHealthApplyPartial = function (ui) {
+    if (!ui || !ui.fragments) return;
+    var f = ui.fragments;
+    var x;
+    x = document.getElementById("health-main-tbody"); if (x) x.innerHTML = f.main_tbody || "";
+    x = document.getElementById("health-gpu-meta-tbody"); if (x) x.innerHTML = f.gpu_meta_tbody || "";
+    x = document.getElementById("health-gpu-device-tbody"); if (x) x.innerHTML = f.gpu_device_tbody || "";
+    x = document.getElementById("health-profile-tbody"); if (x) x.innerHTML = f.profile_tbody || "";
+    x = document.getElementById("health-raw-json"); if (x) x.innerHTML = f.safe_json_pre || "";
+    var seedEl = document.getElementById("uniperceptHealthChartSeed");
+    if (seedEl && ui.chart_seed) {
+      try { seedEl.textContent = JSON.stringify(ui.chart_seed); } catch (e) {}
+    }
+    if (ui.chart_seed) window.__uniHealthAppendChartSeed(ui.chart_seed);
+  };
+  function initFromPageSeed() {
+    if (typeof Chart === "undefined") return;
+    var seed = parseSeed();
+    if (!seed) return;
+    var n = normalizeSeed(seed);
+    var pts = mergePointDedupe(n);
+    createChartsFromPoints(pts);
+  }
+  function loadChartLib() {
+    var s = document.createElement("script");
+    s.async = false;
+    s.src = "__BOOTCDN__";
+    s.onerror = function () {
+      s.onerror = null;
+      s.src = "__STATICFILE__";
+    };
+    s.onload = function () { initFromPageSeed(); };
+    document.head.appendChild(s);
+  }
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", loadChartLib);
+  } else {
+    loadChartLib();
+  }
+})();
+""".replace(
+    "__STORAGE_KEY__", _HEALTH_GPU_SERIES_STORAGE_KEY
+).replace(
+    "__MAX_POINTS__", str(_HEALTH_GPU_SERIES_MAX_POINTS)
+).replace(
+    "__METRICS_JSON__",
+    json.dumps([[k, cid, lbl] for k, cid, lbl in _HEALTH_CHART_METRICS], ensure_ascii=False),
+).replace(
+    "__BOOTCDN__", _CHART_JS_BOOTCDN
+).replace(
+    "__STATICFILE__", _CHART_JS_STATICFILE
+)
+
+
+def _health_html_page(
+    out: Dict[str, Any],
+    *,
+    model_path: str = "",
+    max_new_tokens_effective: Any = None,
+    page_generated_at: str = "",
+    cuda_available: Optional[bool] = None,
+    cuda_device_name: Optional[str] = None,
+) -> str:
+    """浏览器健康页：中文名称与说明，含推理配置与完整 GPU 列。"""
+    plain = _unwrap_described(out)
+    tr_main, tr_gpu_meta, body_gpu, tr_prof, safe_json = _health_render_dynamic_rows(
+        out,
+        model_path=model_path,
+        max_new_tokens_effective=max_new_tokens_effective,
+        page_generated_at=page_generated_at,
+        cuda_available=cuda_available,
+        cuda_device_name=cuda_device_name,
+    )
+    _gpu_meta_empty_row = '<tr><td class="val" colspan="2">—</td></tr>'
+
+    hdr_cells = []
+    for k in _NVIDIA_SMI_FIELD_KEYS_DISPLAY:
+        lbl = _NVIDIA_SMI_FIELD_LABELS_ZH.get(k, k)
+        dsc = _NVIDIA_SMI_LEAF_DESC.get(k, "")
+        hdr_cells.append(
+            f'<th><span class="lbl">{html.escape(lbl, quote=False)}</span>'
+            f'<div class="desc">{html.escape(dsc, quote=False)}</div></th>'
+        )
+    hdr_gpu = "".join(hdr_cells)
+
+    chart_seed = _health_chart_seed(plain, page_generated_at)
+    chart_seed_html = (
+        '<script type="application/json" id="uniperceptHealthChartSeed">'
+        f"{_health_json_for_embedded_script(chart_seed)}</script>"
+    )
+    chart_card_lines: List[str] = []
+    for mkey, cid, lbl in _HEALTH_CHART_METRICS:
+        dsc = _NVIDIA_SMI_LEAF_DESC.get(mkey, "")
+        chart_card_lines.append(
+            "    <div class=\"chart-card\">"
+            f"<h3 id=\"health-chart-title-{cid}\" data-base-title=\"{html.escape(lbl, quote=True)}\">"
+            f"{html.escape(lbl, quote=False)}</h3>"
+            f"<p class=\"desc\">{html.escape(dsc, quote=False)}</p>"
+            f"<div class=\"chart-canvas-wrap\"><canvas id=\"{cid}\"></canvas></div></div>"
+        )
+    chart_cards = "\n".join(chart_card_lines)
+    sk_esc = html.escape(_HEALTH_GPU_SERIES_STORAGE_KEY, quote=False)
+    charts_section = (
+        "  <h2>GPU 指标趋势（本会话）</h2>\n"
+        "  <p class=\"hint chart-trend-hint\">以下折线在浏览器 <code>sessionStorage</code> 中按快照时间累计"
+        f"（键名 <code>{sk_esc}</code>）"
+        "；横轴为时分秒；关闭标签页后清空。"
+        " 开启自动刷新时请求 <code>GET /health?format=json&partial=1</code>（新请求中止未完成的旧请求），无整页重载。 <strong>Chart.js</strong> 优先从 BootCDN 加载，失败时自动改读 staticfile。</p>\n"
+        "  <div class=\"chart-grid\">\n"
+        f"{chart_cards}\n"
+        "  </div>\n"
+        f"{chart_seed_html}\n"
+        f"  <script>\n{_HEALTH_GPU_CHARTS_JS}\n  </script>\n"
+    )
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>UniPercept · 健康检查</title>
+  <style>
+    body {{ font-family: system-ui, sans-serif; margin: 1.5rem; background: #0f1419; color: #e6edf3; }}
+    h1 {{ font-size: 1.25rem; font-weight: 600; margin: 0 0 1rem; }}
+    h2 {{ font-size: 1rem; font-weight: 600; margin: 1.25rem 0 0.5rem; color: #c9d1d9; }}
+    table {{ border-collapse: collapse; width: 100%; max-width: 56rem; margin-bottom: 1rem; }}
+    th, td {{ text-align: left; padding: 0.45rem 0.55rem; border-bottom: 1px solid #30363d; vertical-align: top; }}
+    th {{ width: 13rem; color: #8b949e; font-weight: 500; }}
+    .lbl {{ display: block; color: #c9d1d9; }}
+    .desc {{ font-size: 0.72rem; color: #7d8590; margin-top: 0.25rem; line-height: 1.35; max-width: 22rem; }}
+    .val {{ color: #e6edf3; }}
+    caption {{ text-align: left; font-size: 0.85rem; color: #8b949e; margin-bottom: 0.35rem; }}
+    .scroll-x {{ overflow-x: auto; max-width: 100%; margin-bottom: 1rem; }}
+    .tbl-wide th {{ min-width: 6.5rem; width: auto; }}
+    pre {{ background: #161b22; padding: 1rem; border-radius: 6px; overflow: auto; max-width: 56rem;
+           font-size: 0.78rem; line-height: 1.45; border: 1px solid #30363d; }}
+    .hint {{ font-size: 0.8rem; color: #8b949e; margin-top: 1rem; max-width: 56rem; line-height: 1.45; }}
+    code {{ font-size: 0.85em; background: #21262d; padding: 0.1rem 0.35rem; border-radius: 4px; }}
+    .refresh-bar {{ display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem 1.25rem; margin: 0 0 1.25rem;
+      padding: 0.65rem 0.85rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; max-width: 56rem; }}
+    .refresh-bar label {{ display: inline-flex; align-items: center; gap: 0.45rem; font-size: 0.88rem; color: #c9d1d9; cursor: pointer; }}
+    .refresh-bar input[type="number"] {{
+      width: 5rem; padding: 0.25rem 0.4rem; border-radius: 4px; border: 1px solid #30363d; background: #0d1117; color: #e6edf3; }}
+    .refresh-meta {{ font-size: 0.78rem; color: #8b949e; }}
+    .chart-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(22rem, 1fr)); gap: 1rem; max-width: 64rem; margin-bottom: 1rem; }}
+    .chart-card {{ background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 0.75rem 0.85rem; }}
+    .chart-card h3 {{ font-size: 0.95rem; font-weight: 600; margin: 0 0 0.35rem; color: #c9d1d9; }}
+    .chart-card .desc {{ font-size: 0.72rem; color: #7d8590; margin: 0 0 0.5rem; line-height: 1.35; max-width: none; }}
+    .chart-canvas-wrap {{ position: relative; height: 14rem; width: 100%; }}
+    .chart-trend-hint {{ max-width: 64rem; margin-bottom: 0.75rem; }}
+    .health-charts-top {{ margin: 0 0 1rem; max-width: 64rem; }}
+  </style>
+</head>
+<body>
+  <h1>UniPercept 服务健康检查</h1>
+  <div class="refresh-bar" id="refreshBar">
+    <label><input type="checkbox" id="arOn"/> 自动刷新页面</label>
+    <label>刷新间隔（秒）<input type="number" id="arSec" min="3" max="3600" step="1" value="30"/></label>
+    <span class="refresh-meta" id="arMeta"></span>
+  </div>
+  <div class="health-charts-top">
+{charts_section}
+  </div>
+  <table>
+    <caption>服务与模型概要</caption>
+    <tbody id="health-main-tbody">{tr_main}</tbody>
+  </table>
+  <h2>GPU 查询结果</h2>
+  <table>
+    <caption>nvidia-smi 概要</caption>
+    <tbody id="health-gpu-meta-tbody">{tr_gpu_meta or _gpu_meta_empty_row}</tbody>
+  </table>
+  <div class="scroll-x">
+    <table class="tbl-wide">
+      <caption>GPU 设备明细（各列含义见表头下方说明）</caption>
+      <thead><tr>{hdr_gpu}</tr></thead>
+      <tbody id="health-gpu-device-tbody">{body_gpu}</tbody>
+    </table>
+  </div>
+  <h2>推理与视觉配置</h2>
+  <table>
+    <caption>与当前加载模型相关的关键参数</caption>
+    <tbody id="health-profile-tbody">{tr_prof}</tbody>
+  </table>
+  <p class="hint">自动刷新开关与间隔（秒）保存在浏览器 <code>localStorage</code>；也可用 <code>?ar=1&amp;ar_sec=15</code> 在打开页面时临时指定是否开启与间隔。上方 <strong>GPU 指标趋势</strong> 折线使用 <code>sessionStorage</code>（键名 <code>{html.escape(_HEALTH_GPU_SERIES_STORAGE_KEY, quote=False)}</code>）。开启自动刷新时表格与下方 JSON 由 <code>partial=1</code> 接口增量更新。下方为与 JSON 接口一致的<strong>完整原始数据</strong>（字段名为英文，便于脚本解析）。若只要 JSON 响应，请使用请求头 <code>Accept: application/json</code> 或查询参数 <code>?format=json</code>。</p>
+  <pre id="health-raw-json">{safe_json}</pre>
+{_HEALTH_AUTO_REFRESH_SCRIPT}
+</body>
+</html>"""
+
+
+async def health(request: Request):
+    out = await _health_build_out(request)
     max_nt = STATE.gen_cfg.get("max_new_tokens") if STATE.gen_cfg else None
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     cuda_ok = bool(torch.cuda.is_available())
@@ -595,6 +1061,22 @@ async def health(request: Request):
             cuda_nm = str(torch.cuda.get_device_name(di))
         except Exception:
             cuda_nm = None
+
+    if _health_wants_json(request):
+        if request.query_params.get("partial") == "1":
+            ui = _health_ui_payload(
+                out,
+                model_path=STATE.model_path or "",
+                max_new_tokens_effective=max_nt,
+                page_generated_at=ts,
+                cuda_available=cuda_ok,
+                cuda_device_name=cuda_nm,
+            )
+            merged: Dict[str, Any] = dict(out)
+            merged["_health_ui"] = ui
+            return JSONResponse(merged)
+        return JSONResponse(out)
+
     return HTMLResponse(
         _health_html_page(
             out,

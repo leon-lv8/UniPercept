@@ -15,7 +15,7 @@
 - 键名与字符串均使用英文双引号；字符串内的双引号、反斜杠、换行等须按 JSON 转义。
 - 禁止尾随逗号；禁止 NaN / Infinity / undefined。
 - 布尔值仅允许 JSON 字面量 true / false（禁止 "true" 字符串）；空值用 null。
-- 分数与计数使用 JSON number（禁止写成带引号的数字字符串）。aesthetic.scores 的 iaa、iqa、ista 必须为 number。
+- 分数与计数使用 JSON number（禁止写成带引号的数字字符串）。aesthetic.scores 的 iaa、iqa、ista 为 number 或 null（无评分时填 null）。
 
 ---
 
@@ -35,20 +35,20 @@
 - image_observed：boolean，仅 true 或 false（禁止字符串 "true"/"false"、禁止 true true 重复）
 - notes：string；无则填 "无"
 
-【aesthetic 键列表（仅 task_type 为 aesthetic_analysis 时，全部为 object 内必填，不得为 null）】
-- scores：object，含 iaa、iqa、ista 三个 number，范围 0–100，可含小数
-- subject_and_content、composition、lighting、color、sharpness_and_noise（勿写成 sharp_and_noise）、mood_and_narrative、technical_issues_and_suggestions：均为 string
-- strengths、weaknesses：均为 string 数组，各至少 1 个元素（键名勿写成 weakness、weaknesss、weakweaknesses；lighting 勿写成 lightlight）
+【aesthetic 键列表（仅 task_type 为 aesthetic_analysis 时，object 内下列键须齐全；无内容时 string 用 \"\"、scores 子项用 null、数组用 []，勿省略键）】
+- scores：object，须含 iaa、iqa、ista；每个为 number（0–100，可含小数）或 null；勿写带引号的数字字符串（服务端会规范为 number）
+- subject_and_content、composition、lighting、color、sharpness_and_noise（勿写成 sharp_and_noise）、mood_and_narrative、technical_issues_and_suggestions：均为 string；无内容时用 \"\"，禁止用「占位」类话术充数
+- strengths、weaknesses：均为 string 数组；无条目时用 []；键名勿写成 weakness、weaknesss、weakweaknesses；lighting 勿写成 lightlight
 
 【分场景规则】
 - 非 aesthetic_analysis：aesthetic 必须为 null；strengths、weaknesses、scores 不得出现在根对象，仅可出现在 aesthetic 内。
-- 用户要求图片审美或质量分析：task_type 为 "aesthetic_analysis"，填满 aesthetic 全部字段（含 scores）；summary 可概括总体评价，细节写入 aesthetic；分数与文字自洽。
+- 用户要求图片审美或质量分析：task_type 为 "aesthetic_analysis"，aesthetic 须含上表全部键；无值处用 \"\"、null 或 []；summary 可概括总体评价，细节写入 aesthetic；分数与文字自洽。服务端 repair 仅做键补全与类型/空值规范化，不注入占位长文案。
 - 必须拒答：task_type 为 "refusal"，refusal_reason 为非空 string，summary 与 reasoning_brief 说明拒答要点，aesthetic 为 null。
 - 图像无效或关键信息不足：task_type 为 "insufficient_info"，limitations 说明缺失；aesthetic 一般为 null（除非用户同时要求审美且仍有部分可判读，则按可判读程度填写并降低 confidence）。
 
 ---
 
-【常见错误（禁止，共 8 条）】
+【常见错误（禁止，共 9 条）】
 1. 根级与 aesthetic 内任一 string 值：必须在同一对英文引号内写完再写逗号与换行；禁止 `"confidence": "high` 或 `"summary": "…` 未闭合就换行接下一键（根级 confidence、summary、reasoning_brief 最易漏后半引号）。
 2. aesthetic 内同样禁止 `"color": "…` 未闭合就换行接 `"sharpness_and_noise"`。
 3. 冒号后字符串只能一对引号包裹：禁止 `"schema_version": " "1.0"` 这类多写开引号。
@@ -57,6 +57,7 @@
 6. strengths / weaknesses 须为 JSON 数组 ["…"]，禁止整段当单个未转义字符串、禁止元素内乱嵌未闭合括号。
 7. refusal_reason、meta 必须为根对象字段，禁止写在 aesthetic 内部（若误写，服务端可能纠偏，仍应避免）。
 8. 禁止连续多个英文逗号（,,）；meta.image_observed 禁止字符串布尔与重复 true。
+9. 禁止在键名与冒号之间漏写闭合引号：须写 "schema_version": "1.0"，禁止写成 "schema_version: "1.0"（整段非法；服务端会尝试纠错）。
 
 ---
 
@@ -100,6 +101,6 @@
 
 【输出前自检】
 - 是否仅一个 JSON；顶层键是否齐全且名称无误。
-- task_type 与 aesthetic / refusal_reason 是否一致（aesthetic_analysis 时 aesthetic 非 null 且含 scores 与 strengths/weaknesses）。
-- image_observed 是否为布尔；scores 是否为数字；strengths/weaknesses 是否为字符串数组。
+- task_type 与 aesthetic / refusal_reason 是否一致（aesthetic_analysis 时 aesthetic 为非 null object，且含全部约定键）。
+- image_observed 是否为布尔；scores 各子项是否为 number 或 null；strengths/weaknesses 是否为字符串数组（可为空数组）。
 - 每一 string 字段是否在闭合引号后才进入下一键或逗号。

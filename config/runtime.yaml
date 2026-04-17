@@ -49,7 +49,8 @@ prompt:
   # system_prompt_file -> SYSTEM_PROMPT_FILE：系统提示词文件在容器内的绝对路径。
   #                       与内联环境变量 SYSTEM_PROMPT 二选一；通常用文件便于维护。
   #                       可改为 /workspace/config/system_prompt.txt 等已挂载文件。
-  system_prompt_file: /workspace/config/system_prompt_json.txt
+  # system_prompt_file: /workspace/config/system_prompt_json.txt
+  system_prompt_file: /workspace/config/system_prompt.txt
 
   # json_score_in_user_prompt -> JSON_SCORE_IN_USER_PROMPT：
   #   true  — IAA/IQA/ISTA 由服务端先算分并写入用户侧消息再 chat，助手 JSON 前不再重复三行分数；
@@ -66,14 +67,14 @@ weights:
   #   4bit       — 4 比特量化（更省显存，建议配合较低 vision.input_size、
   #               limits.max_new_tokens，并对质量做抽测）。
   # 留空或不写时由代码默认决定（未设置等价于不通过该变量强制量化）。
-  quant_mode: 4bit
+  quant_mode: 4bit # 8bit
 
   # bnb_4bit：仅当 quant_mode 为 4bit 时由 BitsAndBytesConfig 使用；8bit 时下列项无效果，可保留作切换 4bit 时的模板。
   bnb_4bit:
     # quant_type -> BNB_4BIT_QUANT_TYPE：4bit 量化类型，常用 nf4。
     quant_type: nf4
     # double_quant -> BNB_4BIT_DOUBLE_QUANT：是否嵌套双量化（更省显存，略增计算开销）。
-    double_quant: true
+    double_quant: false
     # compute_fp16 -> BNB_4BIT_COMPUTE_FP16：反量化/矩阵乘是否在 fp16 上算；false 时多为 bf16。
     compute_fp16: true
 
@@ -100,7 +101,7 @@ vision:
   strict_input_size: false
 
   # input_size -> VISION_INPUT_SIZE：图像预处理短边/方形边长（像素）；用于控制显存与速度。
-  input_size: 224
+  input_size: 448 # 224
 
 # -----------------------------------------------------------------------------
 # limits — 请求与资源上限（映射 MAX_IMAGES_PER_REQUEST / MAX_NEW_TOKENS / IMAGE_MAX_BYTES）
