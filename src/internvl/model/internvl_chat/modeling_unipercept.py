@@ -4,6 +4,7 @@
 # Licensed under The MIT License [see LICENSE for details]
 # --------------------------------------------------------
 
+import os
 import warnings
 from typing import List, Optional, Tuple, Union
 
@@ -28,6 +29,19 @@ from .modeling_intern_vit import InternVisionModel, has_flash_attn
 logger = logging.get_logger(__name__)
 
 from .aes_tokens import AESTHETICS_TOKEN_LIST
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _inference_use_cache_default() -> bool:
+    # Keep original default behavior (use_cache=True) unless explicitly disabled.
+    # Set INFERENCE_USE_CACHE=0 to save memory (KV cache can be a major contributor).
+    return _env_bool("INFERENCE_USE_CACHE", True)
+
 
 def version_cmp(v1, v2, op='eq'):
     import operator
@@ -106,6 +120,18 @@ class InternVLChatModel(PreTrainedModel):
 
         if config.use_llm_lora:
             self.wrap_llm_lora(r=config.use_llm_lora, lora_alpha=2 * config.use_llm_lora)
+
+    def _num_image_token_for_pixel_values(self, pixel_values: torch.Tensor) -> int:
+        """Return the per-image <IMG_CONTEXT> token count for the given pixel_values size."""
+        if pixel_values is None:
+            return self.num_image_token
+        # pixel_values: [N, 3, H, W]
+        h = int(pixel_values.shape[-2])
+        w = int(pixel_values.shape[-1])
+        ph = max(1, h // self.patch_size)
+        pw = max(1, w // self.patch_size)
+        # The model later applies pixel shuffle with scale_factor=downsample_ratio, shrinking token grid.
+        return int(ph * pw * (self.downsample_ratio ** 2))
 
     def wrap_backbone_lora(self, r=128, lora_alpha=256, lora_dropout=0.05):
         lora_config = LoraConfig(
@@ -315,6 +341,9 @@ class InternVLChatModel(PreTrainedModel):
             print(f'dynamic ViT batch size: {image_bs}')
 
         queries = []
+        dyn_num_image_token = (
+            self._num_image_token_for_pixel_values(pixel_values) if pixel_values is not None else self.num_image_token
+        )
         for idx, num_patches in enumerate(num_patches_list):
             question = questions[idx]
             if pixel_values is not None and '<image>' not in question:
@@ -325,7 +354,7 @@ class InternVLChatModel(PreTrainedModel):
             template.append_message(template.roles[1], None)
             query = template.get_prompt()
 
-            image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * self.num_image_token * num_patches + IMG_END_TOKEN
+            image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * dyn_num_image_token * num_patches + IMG_END_TOKEN
             query = query.replace('<image>', image_tokens, 1)
             queries.append(query)
 
@@ -383,8 +412,11 @@ class InternVLChatModel(PreTrainedModel):
             image_bs = pixel_values.shape[0]
             print(f'dynamic ViT batch size: {image_bs}')
 
+        dyn_num_image_token = (
+            self._num_image_token_for_pixel_values(pixel_values) if pixel_values is not None else self.num_image_token
+        )
         for num_patches in num_patches_list:
-            image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * self.num_image_token * num_patches + IMG_END_TOKEN
+            image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * dyn_num_image_token * num_patches + IMG_END_TOKEN
             query = query.replace('<image>', image_tokens, 1)
 
         model_inputs = tokenizer(query, return_tensors='pt')
@@ -399,6 +431,10 @@ class InternVLChatModel(PreTrainedModel):
 
         response = tokenizer.batch_decode(generation_output, skip_special_tokens=True)[0]
         response = response.split(template.sep.strip())[0].strip()
+        if _env_bool("CHAT_JSON_REPAIR", True) and response.lstrip().startswith("{"):
+            from internvl.json_assistant_repair import repair_assistant_json_corruption
+
+            response = repair_assistant_json_corruption(response)
         history.append((question, response))
 
         if return_history:
@@ -416,6 +452,7 @@ class InternVLChatModel(PreTrainedModel):
             pixel_values,
             generation_config,
             desc,
+            visual_features=None,
             history=None,
             num_patches_list=None,
             IMG_START_TOKEN='<img>',
@@ -451,8 +488,11 @@ class InternVLChatModel(PreTrainedModel):
             image_bs = pixel_values.shape[0]
             print(f'dynamic ViT batch size: {image_bs}')
 
+        dyn_num_image_token = (
+            self._num_image_token_for_pixel_values(pixel_values) if pixel_values is not None else self.num_image_token
+        )
         for num_patches in num_patches_list:
-            image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * self.num_image_token * num_patches + IMG_END_TOKEN
+            image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * dyn_num_image_token * num_patches + IMG_END_TOKEN
             query = query.replace('<image>', image_tokens, 1)
 
         model_inputs = tokenizer(query, return_tensors='pt')
@@ -461,6 +501,7 @@ class InternVLChatModel(PreTrainedModel):
         attention_mask = model_inputs['attention_mask'].to(device)
         generation_config['eos_token_id'] = eos_token_id
         generation_output = self.generate_logits(pixel_values=pixel_values,
+                                                 visual_features=visual_features,
                                                  input_ids=input_ids,
                                                  attention_mask=attention_mask,
                                                  **generation_config)
@@ -500,7 +541,16 @@ class InternVLChatModel(PreTrainedModel):
             input_ids = input_ids.reshape(B * N)
             selected = (input_ids == self.img_context_token_id)
             assert selected.sum() != 0
-            input_embeds[selected] = vit_embeds.reshape(-1, C).to(input_embeds.device)
+            vit_flat = vit_embeds.reshape(-1, C).to(input_embeds.device)
+            n_sel = int(selected.sum().item())
+            if vit_flat.shape[0] != n_sel:
+                raise RuntimeError(
+                    f"Vision/tokenizer mismatch: {n_sel} <IMG_CONTEXT> slots vs {vit_flat.shape[0]} ViT tokens; "
+                    f"pixel_values shape={tuple(pixel_values.shape)}. "
+                    "Align placeholders with model._num_image_token_for_pixel_values(pixel_values) "
+                    "(see src.serve.chat.chat_engine._tokenized_inputs_for_chat / InternVLChatModel.chat)."
+                )
+            input_embeds[selected] = vit_flat
 
             input_embeds = input_embeds.reshape(B, N, C)
         else:
@@ -511,7 +561,7 @@ class InternVLChatModel(PreTrainedModel):
             attention_mask=attention_mask,
             generation_config=generation_config,
             output_hidden_states=output_hidden_states,
-            use_cache=True,
+            use_cache=_inference_use_cache_default(),
             **generate_kwargs,
         )
 
@@ -542,17 +592,27 @@ class InternVLChatModel(PreTrainedModel):
             input_ids = input_ids.reshape(B * N)
             selected = (input_ids == self.img_context_token_id)
             assert selected.sum() != 0
-            input_embeds[selected] = vit_embeds.reshape(-1, C).to(input_embeds.device)
+            vit_flat = vit_embeds.reshape(-1, C).to(input_embeds.device)
+            n_sel = int(selected.sum().item())
+            if vit_flat.shape[0] != n_sel:
+                raise RuntimeError(
+                    f"Vision/tokenizer mismatch: {n_sel} <IMG_CONTEXT> slots vs {vit_flat.shape[0]} ViT tokens; "
+                    f"pixel_values shape={tuple(pixel_values.shape)}. "
+                    "Align placeholders with model._num_image_token_for_pixel_values(pixel_values) "
+                    "(see src.serve.chat.chat_engine._tokenized_inputs_for_chat / InternVLChatModel.chat)."
+                )
+            input_embeds[selected] = vit_flat
 
             input_embeds = input_embeds.reshape(B, N, C)
         else:
             input_embeds = self.language_model.get_input_embeddings()(input_ids)
 
+        effective_output_hidden_states = output_hidden_states if output_hidden_states is not None else False
         outputs = self.language_model(
             inputs_embeds=input_embeds,
             attention_mask=attention_mask,
-            use_cache=True,
-            output_hidden_states=True,
+            use_cache=_inference_use_cache_default(),
+            output_hidden_states=effective_output_hidden_states,
             return_dict=True,
         )
 

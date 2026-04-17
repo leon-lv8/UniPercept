@@ -58,21 +58,46 @@ services:
     image: unipercept-openai:latest
     container_name: unipercept-openai-gpu
     ports:
-      - "8000:8000"
+      - "18000:8000"
     environment:
+      # OpenAI 兼容接口对外返回/匹配的模型标识（客户端 model 字段常与此一致）
       MODEL_ID: unipercept
+      # 容器内 HTTP 服务监听端口（与上方 ports 的容器侧端口一致）
       PORT: "8000"
+      # 有 GPU 时是否优先走 CUDA；false 则尝试 CPU（显存与速度需自行评估）
       PREFER_CUDA: "true"
+      # 系统提示词文件路径（容器内）；与 SYSTEM_PROMPT 环境变量二选一，通常用文件便于维护
       # SYSTEM_PROMPT_FILE: /workspace/config/system_prompt.txt
       SYSTEM_PROMPT_FILE: /workspace/config/system_prompt_json.txt
-      # 与 JSON 系统提示搭配：true=IAA/IQA/ISTA 先由服务端算好并附在用户消息里再 chat，回复中不再在 JSON 前重复三行分数；false=保持「三行分数\\n\\n正文」旧行为
+      # JSON 系统提示场景：true=IAA/IQA/ISTA 由服务端先算分并写入用户侧消息再 chat，助手回复不再在 JSON 前重复三行分数；false=保留「三行分数 + 正文」旧版排版
       JSON_SCORE_IN_USER_PROMPT: "true"
-      LOAD_IN_8BIT: "true"
-      LOAD_IN_4BIT: "false"
+      # bitsandbytes：8bit 权重加载（与 4bit 勿同时开启，否则启动报错）
+      LOAD_IN_8BIT: "false"
+      # bitsandbytes：4bit 权重加载（省显存；常配合较低 VISION_INPUT_SIZE、MAX_NEW_TOKENS，质量建议抽测）
+      LOAD_IN_4BIT: "true"
+      # 4bit 量化类型（BitsAndBytesConfig），常用 nf4
+      BNB_4BIT_QUANT_TYPE: "nf4"
+      # 4bit 是否启用嵌套双量化（进一步省显存，略增开销）
+      BNB_4BIT_DOUBLE_QUANT: "true"
+      # 4bit 反量化/矩阵乘是否在 fp16 上计算（true=fp16，false 时为 bf16）
+      BNB_4BIT_COMPUTE_FP16: "true"
+      # 生成阶段是否使用 KV cache：1/true=启用（默认，更快）；0/false=关闭可降显存、生成变慢
+      INFERENCE_USE_CACHE: "1"
+      # 是否按动态策略处理视觉输入尺寸，并与 <IMG_CONTEXT> token 数量联动（便于低于 config 的边长）
+      DYNAMIC_IMAGE_SIZE: "true"
+      # VISION_INPUT_SIZE 与模型 config 不一致时：true=直接报错；false=仅告警（常与动态视觉尺寸同用）
+      STRICT_VISION_INPUT_SIZE: "false"
+      # 图像预处理短边/方形边长（像素）；用于控显存与速度
+      VISION_INPUT_SIZE: "224"
+      # 单次请求允许附带的最大图片张数
       MAX_IMAGES_PER_REQUEST: "1"
+      # 单次生成允许的新增 token 上限（越大越耗显存与时间）
       MAX_NEW_TOKENS: "1024"
+      # 单张图片解码/校验允许的最大字节数（防超大 base64 或上传）
       IMAGE_MAX_BYTES: 52428800  # 50MB
+      # NVIDIA 容器插件：对容器暴露哪些 GPU（all 表示全部可见）
       NVIDIA_VISIBLE_DEVICES: all
+      # 容器内可用的 NVIDIA 驱动能力集（compute=CUDA，utility=nvidia-smi 等）
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
     volumes:
       - ./ckpt/unipercept:/models/unipercept:ro

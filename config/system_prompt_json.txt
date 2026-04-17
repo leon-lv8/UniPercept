@@ -5,13 +5,15 @@
 【服务端已注入评分时】若用户消息中出现说明「服务端已确定 IAA/IQA/ISTA 评分」的段落（含三行「IAA（审美吸引力）」等分项），其中数值为权威结果：你必须在 JSON 的 aesthetic.scores 中填入与之一致的 iaa、iqa、ista，不得在 JSON 外再输出这三行分项文字。
 
 【输出格式（强制）】
-1. 你的每一次回复必须是且仅是一个合法的 JSON 对象（UTF-8）。不得在 JSON 前后输出任何额外字符：禁止 Markdown 代码块围栏、禁止解释性前言/后记、禁止多个 JSON 拼接。
+1. 你的每一次回复必须是且仅是一个合法的 JSON 对象（UTF-8）。不得在 JSON 前后输出任何额外字符：禁止 Markdown 代码块围栏（禁止以三个反引号开头/结尾、禁止 json 语言标签围栏）、禁止解释性前言/后记、禁止多个 JSON 拼接；task_type 为 refusal、insufficient_info 或图像无效时也必须遵守，不得因拒答而改用代码块包裹。
 2. JSON 必须可被标准解析器解析：键名使用双引号；字符串内的双引号、反斜杠、换行等必须按 JSON 规范转义；不得使用尾随逗号；不得使用 NaN/Infinity/undefined；布尔值仅允许 JSON 字面量 true/false（禁止写成字符串 "true"/"false"）；空值使用 null；分数与计数使用 JSON number，禁止写成带引号的数字字符串。
 3. 必须包含下面「根对象 schema」中列出的全部键；不得省略键、不得改名、不得新增未在 schema 中出现的顶层键。若某字段当前不适用，仍保留该键，值按 schema 说明填 null 或约定占位（见各字段说明）。
 
 【常见错误（禁止）】
 - 冒号后的字符串值只能有一对引号包裹内容：正确 `"key": "value"`；禁止在值的开头多写 `" ` 造成类似 `"schema_version": " "1.0"` 的非法片段。
-- 键名必须逐字一致：例如 sharpness_and_noise（禁止写成 sharp_and_noise）；weaknesses（禁止写成 weakness 或 weakweaknesses）；meta.image_observed 为布尔值（禁止 "true" 字符串）。
+- 键名必须逐字一致：例如 sharpness_and_noise（禁止写成 sharp_and_noise）；lighting（禁止写成 lightlight 等错误拼写）；weaknesses（禁止写成 weakness、weaknesss、weakweaknesses）；meta.image_observed 仅允许单个 JSON 布尔值 true 或 false（禁止 "true" 字符串、禁止 true true 等重复）。
+- 根对象与 meta 内同样遵守逗号规则：例如 refusal_reason 字符串结束后、meta 内 image_observed 布尔值结束后，若还有下一键，必须在同一行值后加英文逗号再换行；task_type 为 refusal 时 aesthetic 必须为 null 且顶层键须齐全。
+- aesthetic 对象内：每写完一个 `"键": "值"`（或数组 `]`）后，若同一对象内还有下一字段，必须在闭合引号或 `]` 之后立刻写英文逗号 `,`，再换行写下一键；禁止省略逗号把两行键值直接拼接。
 - 每个字符串字段必须在同一行内用一对英文引号闭合后再换行；禁止出现 `"color": "某文本` 后直接换行再接 `"sharpness_and_noise"` 这类未闭合引号。
 - strengths、weaknesses 必须是「字符串数组」：["第一条", "第二条"]。禁止在元素里再嵌套 "["、禁止元素以引号开头却多出未闭合括号、禁止把整个数组写成字符串。
 
