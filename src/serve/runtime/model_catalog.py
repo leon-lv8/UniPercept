@@ -43,27 +43,6 @@ def _model_list_entry(model_id: str) -> ModelObject:
     return base
 
 
-def _model_id_suggests_vision_capabilities(model_id: str) -> bool:
-    m = model_id.lower()
-    return any(
-        needle in m
-        for needle in (
-            "-vl",
-            "-vision",
-            "vl-",
-            "vision",
-            "gpt-4o",
-            "gpt-4-turbo",
-            "o1",
-            "o3",
-            "claude-3",
-            "gemini",
-            "qwen-vl",
-            "internvl",
-        )
-    )
-
-
 def _model_catalog_with_extra_ids(entries: List[ModelObject]) -> List[ModelObject]:
     seen = {e["id"] for e in entries}
     out = list(entries)
@@ -79,17 +58,4 @@ def _model_catalog_with_extra_ids(entries: List[ModelObject]) -> List[ModelObjec
 def _model_catalog_entries() -> List[ModelObject]:
     primary_id = STATE.model_id
     primary = _model_list_entry(primary_id)
-    if not _env_bool("MODEL_ADVERTISE_MULTIMODAL", True) or not _env_bool("MODEL_AUTO_VL_ALIAS", True):
-        return _model_catalog_with_extra_ids([primary])
-
-    if _model_id_suggests_vision_capabilities(primary_id):
-        return _model_catalog_with_extra_ids([primary])
-
-    suffix = (os.environ.get("MODEL_VL_ALIAS_SUFFIX") or "-vl").strip() or "-vl"
-    vl_id = f"{primary_id}{suffix}"
-    vl_entry = _model_list_entry(vl_id)
-    if _env_bool("MODEL_LIST_VL_ALIAS_FIRST", True):
-        ordered = [vl_entry, primary]
-    else:
-        ordered = [primary, vl_entry]
-    return _model_catalog_with_extra_ids(ordered)
+    return _model_catalog_with_extra_ids([primary])

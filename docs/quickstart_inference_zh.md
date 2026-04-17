@@ -108,24 +108,20 @@ huggingface-cli login
 - 不影响基本推理，可直接跳过
 - 继续使用 `unipercept-reward` 常规模式即可
 
-### Q4: 显存不足（CUDA out of memory）
+### Q4: 显存不足（CUDA OOM）
 
 - 先关闭其他占显存进程：`nvidia-smi`
 - 改用 CPU（脚本会自动检测并回退）
 - 或更换更小图片进行测试
-- 服务化部署可启用 8bit 量化（推荐）：
+- 服务化部署（`docker compose --profile gpu`）：量化、视觉尺寸、token 上限等由仓库根目录 `config/runtime.yaml`（分层级 YAML）配置；修改后需重新构建或重启容器生效；可通过环境变量 `RUNTIME_CONFIG_FILE` 指向其它 YAML。
 
 ```bash
-# 开启 8bit（目标：将空载显存降到 10GB 级）
-LOAD_IN_8BIT=true LOAD_IN_4BIT=false docker compose --profile gpu up --build
-
-# 回滚到原始 bf16 加载
-LOAD_IN_8BIT=false LOAD_IN_4BIT=false docker compose --profile gpu up --build
+# 示例：改完后重启 GPU 服务
+docker compose --profile gpu up --build
 ```
 
-- 建议同时收紧请求峰值参数（在 `docker-compose.yml` 的 environment 配置）：
-  - `MAX_IMAGES_PER_REQUEST=1`
-  - `MAX_NEW_TOKENS=256`
+- 在 `runtime.yaml` 的 `weights.quant_mode` 设为 `8bit` 可开启 8bit 量化（目标：将空载显存降到 10GB 级）；`none` / `off` 为不量化（bf16）。
+- 建议同时收紧 `limits` 段（例如 `max_images_per_request: 1`、`max_new_tokens: 256`）以降低峰值显存。
 
 ### Q5: 提示找不到模型目录
 

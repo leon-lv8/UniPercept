@@ -1,0 +1,117 @@
+﻿# =============================================================================
+# OpenAI 兼容推理服务 — 运行时配置（分层级 YAML）
+# =============================================================================
+# 加载方式：src/serve/runtime/runtime_yaml.py 在进程启动最早阶段读取本文件，
+#           将下列字段映射为同名「大写环境变量」写入 os.environ。
+# 生效方式：修改后必须重启容器或 uvicorn 进程；仅改文件不会热更新。
+# 路径说明：容器内默认 /workspace/config/runtime.yaml（由 compose 的
+#           RUNTIME_CONFIG_FILE 与卷 ./config:/workspace/config 提供）。
+# 优先级：  本文件中出现的键会覆盖进程内已有环境变量（YAML 为业务调参主来源）。
+# =============================================================================
+#
+# 字段 -> 环境变量 对照（实现见 runtime_yaml.py 的 _mapping_pairs）
+#   serve.model_id                    -> MODEL_ID
+#   serve.port                        -> PORT
+#   serve.prefer_cuda                 -> PREFER_CUDA
+#   prompt.system_prompt_file         -> SYSTEM_PROMPT_FILE
+#   prompt.json_score_in_user_prompt  -> JSON_SCORE_IN_USER_PROMPT
+#   weights.quant_mode                -> WEIGHT_QUANT_MODE
+#   weights.bnb_4bit.quant_type       -> BNB_4BIT_QUANT_TYPE
+#   weights.bnb_4bit.double_quant     -> BNB_4BIT_DOUBLE_QUANT
+#   weights.bnb_4bit.compute_fp16     -> BNB_4BIT_COMPUTE_FP16
+#   inference.use_cache               -> INFERENCE_USE_CACHE
+#   vision.dynamic_image_size         -> DYNAMIC_IMAGE_SIZE
+#   vision.strict_input_size          -> STRICT_VISION_INPUT_SIZE
+#   vision.input_size                 -> VISION_INPUT_SIZE
+#   limits.max_images_per_request     -> MAX_IMAGES_PER_REQUEST
+#   limits.max_new_tokens             -> MAX_NEW_TOKENS
+#   limits.image_max_bytes            -> IMAGE_MAX_BYTES
+#
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# serve — HTTP 服务与设备选择（映射 MODEL_ID / PORT / PREFER_CUDA）
+# -----------------------------------------------------------------------------
+serve:
+  # model_id -> MODEL_ID：OpenAI 兼容接口对外返回、以及请求体里 model 字段可匹配的模型标识。
+  model_id: unipercept
+
+  # port -> PORT：容器内 HTTP 监听端口；须与 docker-compose 里 ports 的「容器侧」端口一致。
+  port: 8000
+
+  # prefer_cuda -> PREFER_CUDA：是否在可用时优先使用 CUDA；false 时尝试 CPU（速度/显存需自行评估）。
+  prefer_cuda: true
+
+# -----------------------------------------------------------------------------
+# prompt — 系统提示词与 JSON 打分排版（映射 SYSTEM_PROMPT_FILE / JSON_SCORE_IN_USER_PROMPT）
+# -----------------------------------------------------------------------------
+prompt:
+  # system_prompt_file -> SYSTEM_PROMPT_FILE：系统提示词文件在容器内的绝对路径。
+  #                       与内联环境变量 SYSTEM_PROMPT 二选一；通常用文件便于维护。
+  #                       可改为 /workspace/config/system_prompt.txt 等已挂载文件。
+  system_prompt_file: /workspace/config/system_prompt_json.txt
+
+  # json_score_in_user_prompt -> JSON_SCORE_IN_USER_PROMPT：
+  #   true  — IAA/IQA/ISTA 由服务端先算分并写入用户侧消息再 chat，助手 JSON 前不再重复三行分数；
+  #   false — 保留旧版「三行分数 + 正文」排版。
+  json_score_in_user_prompt: true
+
+# -----------------------------------------------------------------------------
+# weights — 权重量化（映射 WEIGHT_QUANT_MODE / BNB_4BIT_*）
+# -----------------------------------------------------------------------------
+weights:
+  # quant_mode -> WEIGHT_QUANT_MODE：bitsandbytes 加载策略。
+  #   none / off — 不量化（CUDA 下常为 bf16）；
+  #   8bit       — 8 比特量化（常用以省显存）；
+  #   4bit       — 4 比特量化（更省显存，建议配合较低 vision.input_size、
+  #               limits.max_new_tokens，并对质量做抽测）。
+  # 留空或不写时由代码默认决定（未设置等价于不通过该变量强制量化）。
+  quant_mode: 4bit
+
+  # bnb_4bit：仅当 quant_mode 为 4bit 时由 BitsAndBytesConfig 使用；8bit 时下列项无效果，可保留作切换 4bit 时的模板。
+  bnb_4bit:
+    # quant_type -> BNB_4BIT_QUANT_TYPE：4bit 量化类型，常用 nf4。
+    quant_type: nf4
+    # double_quant -> BNB_4BIT_DOUBLE_QUANT：是否嵌套双量化（更省显存，略增计算开销）。
+    double_quant: true
+    # compute_fp16 -> BNB_4BIT_COMPUTE_FP16：反量化/矩阵乘是否在 fp16 上算；false 时多为 bf16。
+    compute_fp16: true
+
+# -----------------------------------------------------------------------------
+# inference — 生成行为（映射 INFERENCE_USE_CACHE）
+# -----------------------------------------------------------------------------
+inference:
+  # use_cache -> INFERENCE_USE_CACHE：生成阶段是否使用 KV cache。
+  #   true  — 默认更快；
+  #   false — 可降低显存占用，生成变慢。
+  use_cache: true
+
+# -----------------------------------------------------------------------------
+# vision — 图像预处理与尺寸校验（映射 DYNAMIC_IMAGE_SIZE / STRICT_VISION_INPUT_SIZE / VISION_INPUT_SIZE）
+# -----------------------------------------------------------------------------
+vision:
+  # dynamic_image_size -> DYNAMIC_IMAGE_SIZE：是否按动态策略处理视觉输入尺寸，并与 <IMG_CONTEXT> token 数量联动
+  #                      （便于使用低于模型 config 的边长）。
+  dynamic_image_size: true
+
+  # strict_input_size -> STRICT_VISION_INPUT_SIZE：当 vision.input_size 与模型 config 不一致时，
+  #   true  — 直接报错；
+  #   false — 仅打日志告警（常与 dynamic_image_size 同开）。
+  strict_input_size: false
+
+  # input_size -> VISION_INPUT_SIZE：图像预处理短边/方形边长（像素）；用于控制显存与速度。
+  input_size: 224
+
+# -----------------------------------------------------------------------------
+# limits — 请求与资源上限（映射 MAX_IMAGES_PER_REQUEST / MAX_NEW_TOKENS / IMAGE_MAX_BYTES）
+# -----------------------------------------------------------------------------
+limits:
+  # max_images_per_request -> MAX_IMAGES_PER_REQUEST：单次请求允许附带的最大图片张数。
+  max_images_per_request: 1
+
+  # max_new_tokens -> MAX_NEW_TOKENS：单次生成允许的新增 token 上限；越大越占显存与时间。
+  max_new_tokens: 2048
+
+  # image_max_bytes -> IMAGE_MAX_BYTES：单张图片解码/校验允许的最大字节数（防超大 base64 或 URL 拉取）。
+  #                  52428800 = 50 MiB；可按部署调大/调小。
+  image_max_bytes: 52428800

@@ -1,8 +1,12 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import sys
 
 sys.path.append("src")
+
+from .runtime.runtime_yaml import apply_runtime_yaml_to_environ
+
+apply_runtime_yaml_to_environ()
 
 from fastapi import FastAPI
 

@@ -57,12 +57,31 @@ def _select_dtype(device: torch.device) -> torch.dtype:
     return torch.float32
 
 
+def _parse_weight_quant_mode() -> Optional[Tuple[bool, bool]]:
+    """If WEIGHT_QUANT_MODE is set and non-empty, return (load_in_8bit, load_in_4bit)."""
+    raw = os.environ.get("WEIGHT_QUANT_MODE")
+    if raw is None:
+        return None
+    mode = raw.strip().lower()
+    if not mode:
+        return None
+    if mode in ("none", "off"):
+        return False, False
+    if mode in ("8bit", "8-bit"):
+        return True, False
+    if mode in ("4bit", "4-bit"):
+        return False, True
+    raise RuntimeError(
+        "Invalid WEIGHT_QUANT_MODE=%r; use one of: none, off, 8bit, 4bit "
+        "(aliases: 8-bit, 4-bit)." % (raw,)
+    )
+
+
 def _quantization_flags() -> Tuple[bool, bool]:
-    load_in_8bit = _env_bool("LOAD_IN_8BIT", False)
-    load_in_4bit = _env_bool("LOAD_IN_4BIT", False)
-    if load_in_8bit and load_in_4bit:
-        raise RuntimeError("LOAD_IN_8BIT and LOAD_IN_4BIT cannot both be true")
-    return load_in_8bit, load_in_4bit
+    parsed = _parse_weight_quant_mode()
+    if parsed is not None:
+        return parsed
+    return False, False
 
 
 def _quantized_device_map(device: torch.device):
@@ -77,7 +96,7 @@ def _quantization_config(load_in_8bit: bool, load_in_4bit: bool) -> Optional[Any
     if BitsAndBytesConfig is None:
         raise RuntimeError(
             "bitsandbytes support is not available. Rebuild with INSTALL_BITSANDBYTES=true "
-            "or disable LOAD_IN_8BIT/LOAD_IN_4BIT."
+            "or set WEIGHT_QUANT_MODE=none."
         )
     if load_in_8bit:
         return BitsAndBytesConfig(load_in_8bit=True)
