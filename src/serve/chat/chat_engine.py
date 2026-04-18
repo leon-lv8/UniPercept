@@ -111,13 +111,6 @@ def _score_desc_for_metric(metric: str) -> str:
     raise ValueError(f"unknown score metric: {metric!r}")
 
 
-def _question_is_visual_only_placeholder(q: str) -> bool:
-    t = q.strip()
-    if not t:
-        return True
-    return not t.replace("<image>", "").strip()
-
-
 def _strip_leading_hallucinated_score_tail(text: str) -> str:
     if not text:
         return text

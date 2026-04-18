@@ -3,7 +3,9 @@
 # =============================================================================
 # 加载方式：src/serve/runtime/runtime_yaml.py 在进程启动最早阶段读取本文件，
 #           将下列字段映射为同名「大写环境变量」写入 os.environ。
-# 生效方式：修改后必须重启容器或 uvicorn 进程；仅改文件不会热更新。
+# 生效方式：大多数字段修改后需重启容器或 uvicorn 进程；仅改文件默认不会热更新。
+#          例外：SYSTEM_PROMPT_FILE 指向的提示词文本可通过
+#          POST /admin/prompt/reload（或 /health 页面按钮）热重载。
 # 路径说明：容器内默认 /workspace/config/runtime.yaml（由 compose 的
 #           RUNTIME_CONFIG_FILE 与卷 ./config:/workspace/config 提供）。
 # 优先级：  本文件中出现的键会覆盖进程内已有环境变量（YAML 为业务调参主来源）。
@@ -14,7 +16,6 @@
 #   serve.port                        -> PORT
 #   serve.prefer_cuda                 -> PREFER_CUDA
 #   prompt.system_prompt_file         -> SYSTEM_PROMPT_FILE
-#   prompt.json_score_in_user_prompt  -> JSON_SCORE_IN_USER_PROMPT
 #   logging.enable_debug              -> ENABLE_DEBUG_LOG
 #   weights.llm.quant_mode            -> WEIGHT_QUANT_MODE_LLM
 #   weights.vision.quant_mode         -> WEIGHT_QUANT_MODE_VISION
@@ -27,6 +28,7 @@
 #   weights.cuda.force_reclaim_between_towers -> FORCE_RECLAIM_BETWEEN_TOWERS
 #   weights.bnb_modules_to_not_convert -> BNB_MODULES_TO_NOT_CONVERT（逗号分隔，可选）
 #   inference.use_cache               -> INFERENCE_USE_CACHE
+#   inference.disconnect_cancel_grace_sec -> DISCONNECT_CANCEL_GRACE_SEC
 #   vision.dynamic_image_size         -> DYNAMIC_IMAGE_SIZE
 #   vision.strict_input_size          -> STRICT_VISION_INPUT_SIZE
 #   vision.input_size                 -> VISION_INPUT_SIZE
@@ -50,18 +52,13 @@ serve:
   prefer_cuda: true
 
 # -----------------------------------------------------------------------------
-# prompt — 系统提示词与 JSON 打分排版（映射 SYSTEM_PROMPT_FILE / JSON_SCORE_IN_USER_PROMPT）
+# prompt — 系统提示词（映射 SYSTEM_PROMPT_FILE）
 # -----------------------------------------------------------------------------
 prompt:
   # system_prompt_file -> SYSTEM_PROMPT_FILE：系统提示词文件在容器内的绝对路径。
   #                       与内联环境变量 SYSTEM_PROMPT 二选一；通常用文件便于维护。
-  #                       可改为 /workspace/config/system_prompt.txt 等已挂载文件。
+  #                       默认建议使用严格 JSON 版本提示词。
   system_prompt_file: /workspace/config/system_prompt_json.txt
-
-  # json_score_in_user_prompt -> JSON_SCORE_IN_USER_PROMPT：
-  #   true  — IAA/IQA/ISTA 由服务端先算分并写入用户侧消息再 chat，助手 JSON 前不再重复三行分数；
-  #   false — 保留旧版「三行分数 + 正文」排版。
-  json_score_in_user_prompt: true
 
 # -----------------------------------------------------------------------------
 # logging — 服务调试日志（映射 ENABLE_DEBUG_LOG）
@@ -146,6 +143,10 @@ inference:
   #   true  — 默认更快；
   #   false — 可降低显存占用，生成变慢。
   use_cache: true
+  # disconnect_cancel_grace_sec -> DISCONNECT_CANCEL_GRACE_SEC：
+  #   当客户端断开连接后，服务端等待多少秒再触发“协作式停止推理”。
+  #   建议 1~5 秒：过小可能误杀短暂网络抖动，过大则浪费 GPU 计算。
+  disconnect_cancel_grace_sec: 3
 
 # -----------------------------------------------------------------------------
 # vision — 图像预处理与尺寸校验（映射 DYNAMIC_IMAGE_SIZE / STRICT_VISION_INPUT_SIZE / VISION_INPUT_SIZE）

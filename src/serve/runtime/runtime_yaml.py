@@ -54,8 +54,6 @@ def _mapping_pairs(data: Mapping[str, Any]) -> List[Tuple[str, str]]:
     prompt = section("prompt")
     if "system_prompt_file" in prompt:
         out.append(("SYSTEM_PROMPT_FILE", _as_env_str(prompt["system_prompt_file"])))
-    if "json_score_in_user_prompt" in prompt:
-        out.append(("JSON_SCORE_IN_USER_PROMPT", _as_env_str(prompt["json_score_in_user_prompt"])))
 
     logging_cfg = section("logging")
     if "enable_debug" in logging_cfg:
@@ -102,6 +100,8 @@ def _mapping_pairs(data: Mapping[str, Any]) -> List[Tuple[str, str]]:
     inf = section("inference")
     if "use_cache" in inf:
         out.append(("INFERENCE_USE_CACHE", _as_env_str(inf["use_cache"])))
+    if "disconnect_cancel_grace_sec" in inf:
+        out.append(("DISCONNECT_CANCEL_GRACE_SEC", _as_env_str(inf["disconnect_cancel_grace_sec"])))
 
     vision = section("vision")
     if "dynamic_image_size" in vision:

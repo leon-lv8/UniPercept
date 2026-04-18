@@ -360,6 +360,48 @@ _HEALTH_AUTO_REFRESH_SCRIPT = """<script>
 </script>"""
 
 
+_HEALTH_PROMPT_RELOAD_SCRIPT = """<script>
+(function () {
+  var btn = document.getElementById("promptReloadBtn");
+  var meta = document.getElementById("promptReloadMeta");
+  if (!btn || !meta) return;
+  function setMeta(msg) { meta.textContent = msg || ""; }
+  btn.addEventListener("click", function () {
+    if (btn.disabled) return;
+    // 请求生命周期提示：发起 -> 成功/失败，便于快速排障。
+    btn.disabled = true;
+    setMeta("重载中…");
+    fetch("/admin/prompt/reload", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { Accept: "application/json" }
+    })
+      .then(function (r) {
+        return r.json().catch(function () { return {}; }).then(function (body) {
+          if (!r.ok) {
+            var msg = body && body.detail ? body.detail : ("HTTP " + r.status);
+            throw new Error(msg);
+          }
+          return body || {};
+        });
+      })
+      .then(function (body) {
+        var src = body.source || "unknown";
+        var changed = body.changed ? "有变化" : "无变化";
+        var len = body.length !== undefined ? body.length : "?";
+        setMeta("重载成功：" + changed + "，长度 " + len + "，来源 " + src);
+      })
+      .catch(function (e) {
+        setMeta("重载失败：" + (e && e.message ? e.message : String(e)));
+      })
+      .finally(function () {
+        btn.disabled = false;
+      });
+  });
+})();
+</script>"""
+
+
 def _unwrap_described(obj: Any) -> Any:
     """Strip {value, description} wrappers used by /health JSON for machine clients."""
     if isinstance(obj, dict):
@@ -1024,6 +1066,11 @@ def _health_html_page(
     .refresh-bar input[type="number"] {{
       width: 5rem; padding: 0.25rem 0.4rem; border-radius: 4px; border: 1px solid #30363d; background: #0d1117; color: #e6edf3; }}
     .refresh-meta {{ font-size: 0.78rem; color: #8b949e; }}
+    .op-bar {{ display: flex; flex-wrap: wrap; align-items: center; gap: 0.65rem; margin: 0 0 1rem;
+      padding: 0.65rem 0.85rem; background: #161b22; border: 1px solid #30363d; border-radius: 6px; max-width: 56rem; }}
+    .op-btn {{ border: 1px solid #30363d; background: #21262d; color: #e6edf3; border-radius: 6px; padding: 0.42rem 0.75rem; cursor: pointer; }}
+    .op-btn:disabled {{ opacity: 0.6; cursor: not-allowed; }}
+    .op-meta {{ font-size: 0.78rem; color: #8b949e; }}
     .chart-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(22rem, 1fr)); gap: 1rem; max-width: 64rem; margin-bottom: 1rem; }}
     .chart-card {{ background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 0.75rem 0.85rem; }}
     .chart-card h3 {{ font-size: 0.95rem; font-weight: 600; margin: 0 0 0.35rem; color: #c9d1d9; }}
@@ -1039,6 +1086,10 @@ def _health_html_page(
     <label><input type="checkbox" id="arOn"/> 自动刷新页面</label>
     <label>刷新间隔（秒）<input type="number" id="arSec" min="3" max="3600" step="1" value="30"/></label>
     <span class="refresh-meta" id="arMeta"></span>
+  </div>
+  <div class="op-bar">
+    <button type="button" class="op-btn" id="promptReloadBtn">重载系统提示词</button>
+    <span class="op-meta" id="promptReloadMeta">点击后调用 POST /admin/prompt/reload</span>
   </div>
   <div class="health-charts-top">
 {charts_section}
@@ -1067,6 +1118,7 @@ def _health_html_page(
   <p class="hint">自动刷新开关与间隔（秒）保存在浏览器 <code>localStorage</code>；也可用 <code>?ar=1&amp;ar_sec=15</code> 在打开页面时临时指定是否开启与间隔。上方 <strong>GPU 指标趋势</strong> 折线使用 <code>sessionStorage</code>（键名 <code>{html.escape(_HEALTH_GPU_SERIES_STORAGE_KEY, quote=False)}</code>）。开启自动刷新时表格与下方 JSON 由 <code>partial=1</code> 接口增量更新。下方为与 JSON 接口一致的<strong>完整原始数据</strong>（字段名为英文，便于脚本解析）。若只要 JSON 响应，请使用请求头 <code>Accept: application/json</code> 或查询参数 <code>?format=json</code>。</p>
   <pre id="health-raw-json">{safe_json}</pre>
 {_HEALTH_AUTO_REFRESH_SCRIPT}
+{_HEALTH_PROMPT_RELOAD_SCRIPT}
 </body>
 </html>"""
 

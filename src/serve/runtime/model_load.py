@@ -179,6 +179,50 @@ def _apply_system_prompt_override(model: InternVLChatModel) -> None:
     logger.info("System prompt override applied from %s", source)
 
 
+def _system_prompt_preview(text: str, max_len: int = 96) -> str:
+    compact = " ".join(text.split())
+    if len(compact) <= max_len:
+        return compact
+    return compact[: max_len - 3] + "..."
+
+
+async def _reload_system_prompt_runtime() -> Dict[str, Any]:
+    """Hot-reload SYSTEM_PROMPT_FILE into in-memory model.system_message."""
+    if STATE.model is None:
+        raise RuntimeError("模型尚未就绪，无法重载系统提示词。")
+
+    prompt, source = _configured_system_prompt()
+    if not prompt or not source:
+        raise RuntimeError("未读取到系统提示词。请先设置 SYSTEM_PROMPT_FILE 并确保文件内容非空。")
+
+    # Serialize with inference path to avoid mutating model fields during generation.
+    async with STATE.lock:
+        if STATE.model is None:
+            raise RuntimeError("模型尚未就绪，无法重载系统提示词。")
+        prev_prompt = str(getattr(STATE.model, "system_message", "") or "")
+        STATE.model.system_message = prompt
+
+    changed = prev_prompt != prompt
+    if _debug_enabled():
+        logger.debug(
+            "系统提示词热重载完成：source=%s changed=%s old_len=%s new_len=%s preview=%s",
+            source,
+            changed,
+            len(prev_prompt),
+            len(prompt),
+            _system_prompt_preview(prompt),
+        )
+    logger.info("System prompt hot reloaded from %s (changed=%s)", source, changed)
+    return {
+        "ok": True,
+        "source": source,
+        "changed": changed,
+        "length": len(prompt),
+        "preview": _system_prompt_preview(prompt),
+        "updated_at": _now_ts(),
+    }
+
+
 def _load_model(model_path: str, device: torch.device) -> Tuple[InternVLChatModel, object, Dict]:
     if _debug_enabled():
         logger.debug("【加载/分词器】开始加载，模型路径=%s，目标设备=%s", model_path, device)

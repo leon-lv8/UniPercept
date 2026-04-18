@@ -113,7 +113,8 @@ huggingface-cli login
 - 先关闭其他占显存进程：`nvidia-smi`
 - 改用 CPU（脚本会自动检测并回退）
 - 或更换更小图片进行测试
-- 服务化部署（`docker compose --profile gpu`）：量化、视觉尺寸、token 上限等由仓库根目录 `config/runtime.yaml`（分层级 YAML）配置；修改后需重新构建或重启容器生效；可通过环境变量 `RUNTIME_CONFIG_FILE` 指向其它 YAML。
+- 服务化部署（`docker compose --profile gpu`）：量化、视觉尺寸、token 上限等由仓库根目录 `config/runtime.yaml`（分层级 YAML）配置；大多数配置修改后需重新构建或重启容器生效；可通过环境变量 `RUNTIME_CONFIG_FILE` 指向其它 YAML。  
+  仅“系统提示词文件内容”支持热重载：修改 `SYSTEM_PROMPT_FILE` 指向的文件后，调用 `POST /admin/prompt/reload` 即可生效，无需重启；也可在 `GET /health` 页面点击“重载系统提示词”按钮触发。
 
 ```bash
 # 示例：改完后重启 GPU 服务

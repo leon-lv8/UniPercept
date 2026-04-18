@@ -28,6 +28,7 @@ logging.getLogger("uvicorn.error").info(
 from fastapi import FastAPI
 
 from .runtime.lifespan import lifespan
+from .routes.admin_prompt import router as admin_prompt_router
 from .routes.chat import router as chat_router
 from .routes.health import router as health_router
 from .routes.models import router as models_router
@@ -36,3 +37,4 @@ app = FastAPI(title="UniPercept OpenAI-Compatible Server", lifespan=lifespan)
 app.include_router(health_router)
 app.include_router(models_router)
 app.include_router(chat_router)
+app.include_router(admin_prompt_router)
