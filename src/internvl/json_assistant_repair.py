@@ -316,6 +316,80 @@ def _collapse_duplicate_commas(t: str) -> str:
     return t
 
 
+def _strip_spurious_comma_string_tokens(t: str) -> str:
+    """
+    模型偶发在字段之间插入多余的字符串 token，例如：
+      "schema_version": "1.0",", "task_type": ...
+    其中中间的 \",\" 是一个独立的 JSON 字符串，会导致解析失败。
+    """
+    prev = None
+    while prev != t:
+        prev = t
+        # "1.0",", "task_type" -> "1.0", "task_type"（字段间多出 ,", ", ；须保留下一键的开引号）
+        t = re.sub(r',\s*"\s*,\s*"\s*', ', "', t)
+        # ..., ",", ...  / ..., ", ", ...
+        t = re.sub(r',\s*"\s*,\s*"\s*,', ",", t)
+        # ..., "," , "next_key": ...
+        t = re.sub(r',\s*"\s*,\s*"\s*(?=")', ",", t)
+        # ..., ", "task_type": ...  (spurious string consumes the key's opening quote)
+        t = re.sub(
+            r',\s*"\s*,\s*"\s*([A-Za-z_][A-Za-z0-9_]*)"\s*:',
+            r', "\1":',
+            t,
+        )
+    return t
+
+
+def _quote_bare_string_array_items_for_keys(t: str, keys: Sequence[str]) -> str:
+    """
+    strengths/weaknesses 偶发输出未加引号的元素：
+      "strengths": ["完美技术巅峰", 经典永恒主题"]
+    这里会补上缺失的引号，并尽量避免误伤数字/true/false/null。
+    """
+
+    def _fix_array_body(body: str) -> str:
+        b = body
+        # 末项写成 , 经典永恒主题"]（缺左引号、多一个右引号），先收口再跑通用规则。
+        b = re.sub(
+            r',\s*([A-Za-z_\u4e00-\u9fff][^,"\]\n]*?)"\s*\]',
+            lambda m: ", " + json.dumps(m.group(1).strip(), ensure_ascii=False) + "]",
+            b,
+        )
+        b = re.sub(
+            r'\[\s*([A-Za-z_\u4e00-\u9fff][^,"\]\n]*?)"\s*\]',
+            lambda m: "[" + json.dumps(m.group(1).strip(), ensure_ascii=False) + "]",
+            b,
+        )
+        # Quote first element if bare.
+        b = re.sub(
+            r'(\[\s*)(?!")([A-Za-z_\u4e00-\u9fff][^,\]\n"]*)(?=\s*(?:,|\]))',
+            lambda m: m.group(1) + json.dumps(m.group(2).strip(), ensure_ascii=False),
+            b,
+        )
+        # Quote subsequent elements if bare.
+        b = re.sub(
+            r'(,\s*)(?!")([A-Za-z_\u4e00-\u9fff][^,\]\n"]*)(?=\s*(?:,|\]))',
+            lambda m: m.group(1) + json.dumps(m.group(2).strip(), ensure_ascii=False),
+            b,
+        )
+        # If we created ..."<text>""] (extra stray quote before ]), strip the stray quote.
+        b = re.sub(r'(?<=[^\s\[,])"\s*"\s*(\])', r'"\1', b)
+        return b
+
+    out = t
+    for k in keys:
+        # Capture array content non-greedily up to the next closing bracket.
+        pat = rf'("{re.escape(k)}"\s*:\s*)(\[[\s\S]*?\])'
+
+        def _repl(m: Match[str]) -> str:
+            prefix, arr = m.group(1), m.group(2)
+            # Only attempt when it still looks like an array; keep prefix unchanged.
+            return prefix + _fix_array_body(arr)
+
+        out = re.sub(pat, _repl, out)
+    return out
+
+
 def _strip_illegal_comma_before_close(t: str) -> str:
     return re.sub(r",(\s*[}\]])", r"\1", t)
 
@@ -435,6 +509,7 @@ def _heuristic_repair_text(blob: str) -> str:
     """Single pass of text-level fixes (order matters loosely; run twice for stability)."""
     t = blob
     t = _collapse_duplicate_commas(t)
+    t = _strip_spurious_comma_string_tokens(t)
     t = _strip_illegal_comma_before_close(t)
     t = _normalize_ascii_double_quotes_for_json_repair(t)
     t = _fix_missing_closing_quote_before_colon_after_known_keys(t)
@@ -443,9 +518,11 @@ def _heuristic_repair_text(blob: str) -> str:
     t = _fix_missing_comma_after_closed_string_value_before_next_key(t)
     t = _fix_adjacent_string_pairs(t)
     t = _fix_structural_commas(t)
+    t = _quote_bare_string_array_items_for_keys(t, ("strengths", "weaknesses"))
     t = _strip_spurious_quote_after_value_open(t)
     t = _normalize_meta_booleans(t)
     t = _collapse_duplicate_commas(t)
+    t = _strip_spurious_comma_string_tokens(t)
     t = _strip_illegal_comma_before_close(t)
     return t
 
@@ -480,6 +557,8 @@ def repair_assistant_json_corruption(text: str) -> str:
     s = _apply_key_alias_replacements(s)
     s = _fix_missing_comma_after_closed_string_value_before_next_key(s)
     s = _normalize_meta_booleans(s)
+    s = _strip_spurious_comma_string_tokens(s)
+    s = _quote_bare_string_array_items_for_keys(s, ("strengths", "weaknesses"))
     if not s.startswith("{"):
         return raw
 
@@ -498,4 +577,6 @@ def repair_assistant_json_corruption(text: str) -> str:
     if repaired != fixed:
         return repaired
 
-    return fixed if fixed != s else raw
+    # fixed 可能与 s 相同（启发式对本轮输入已是稳态），但仍优于未处理的 raw：
+    # 前面已对 s 做过围栏剥离、逗号/引号纠错等，绝不能因 fixed==s 而回退到 raw。
+    return fixed

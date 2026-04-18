@@ -1,0 +1,78 @@
+﻿{
+  "name": "UniPercept（无 NVIDIA 时删除 runArgs；权重放 ckpt/unipercept 或改 MODEL_PATH）",
+  "build": {
+    "context": "..",
+    "dockerfile": "../docker/Dockerfile",
+    "options": {
+      "target": "runtime"
+    },
+    "args": {
+      "INSTALL_GIT": "true",
+      "INSTALL_BITSANDBYTES": "true",
+      "INSTALL_FLASH_ATTN": "false"
+    }
+  },
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+  "overrideCommand": true,
+  "runArgs": [
+    "--gpus=all"
+  ],
+  "mounts": [
+    "source=${localWorkspaceFolder}/ckpt/unipercept,target=/models/unipercept,type=bind,consistency=cached",
+    "source=vscode-server,target=/root/.vscode-server,type=volume", // 扩展缓存
+    "source=vscode-devcontainer,target=/root/.devcontainer,type=volume" // 扩展缓存
+  ],
+  "containerEnv": {
+    "MODEL_PATH": "/models/unipercept",
+    "MODEL_ID": "unipercept",
+    "PREFER_CUDA": "true",
+    "USE_FLASH_ATTN": "true",
+    "TZ": "Asia/Shanghai" // 时区
+  },
+  "remoteEnv": {
+    "PYTHONPATH": "${containerWorkspaceFolder}/src"
+  },
+  "forwardPorts": [
+    8000
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "streetsidesoftware.code-spell-checker", // 拼写检查
+        "w88975.code-translate", // 翻译
+        "dbaeumer.vscode-eslint", // eslint
+        "kisstkondoros.vscode-gutter-preview", // 图片预览
+        "yzhang.markdown-all-in-one", // markdown
+        "christian-kohler.path-intellisense", // 路径解析
+        "esbenp.prettier-vscode", // 代码美化
+        "DotJoshJohnson.xml", // xml
+        "redhat.vscode-yaml", // yaml
+        "formulahendry.code-runner", // 运行代码
+        "shardulm94.trailing-spaces", // 缩进
+        "cweijan.vscode-mysql-client2", // 连接 mysql
+        "wix.vscode-import-cost", // 查看导入包大小
+        "russell.any-rule", // 正则
+        "VASubasRaj.flashpost", // 接口测试
+        "ms-vscode.hexeditor", // 二进制编辑器
+        "eamodio.gitlens", // git 插件
+        "mhutchie.git-graph", // git 插件
+        "Arjun.swagger-viewer", // swagger 预览
+        "shd101wyy.markdown-preview-enhanced", // markdown 预览
+        "stylelint.vscode-stylelint", // 格式化
+        "mkxml.vscode-filesize", // 查看文件大小
+        "ecmel.vscode-html-css", // html css 支持
+        "foxundermoon.shell-format", // 格式化 shell
+        "Alibaba-Cloud.tongyi-lingma", // 阿里通义灵码
+        "RooVeterinaryInc.roo-cline" // 自用 ai
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/opt/conda/bin/python",
+        "extensions.autoUpdate": false,
+        "extensions.autoCheckUpdates": false
+      }
+    }
+  }
+}

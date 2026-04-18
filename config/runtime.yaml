@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # OpenAI 兼容推理服务 — 运行时配置（分层级 YAML）
 # =============================================================================
 # 加载方式：src/serve/runtime/runtime_yaml.py 在进程启动最早阶段读取本文件，
@@ -15,10 +15,17 @@
 #   serve.prefer_cuda                 -> PREFER_CUDA
 #   prompt.system_prompt_file         -> SYSTEM_PROMPT_FILE
 #   prompt.json_score_in_user_prompt  -> JSON_SCORE_IN_USER_PROMPT
-#   weights.quant_mode                -> WEIGHT_QUANT_MODE
-#   weights.bnb_4bit.quant_type       -> BNB_4BIT_QUANT_TYPE
-#   weights.bnb_4bit.double_quant     -> BNB_4BIT_DOUBLE_QUANT
-#   weights.bnb_4bit.compute_fp16     -> BNB_4BIT_COMPUTE_FP16
+#   logging.enable_debug              -> ENABLE_DEBUG_LOG
+#   weights.llm.quant_mode            -> WEIGHT_QUANT_MODE_LLM
+#   weights.vision.quant_mode         -> WEIGHT_QUANT_MODE_VISION
+#   weights.llm.bnb_4bit.quant_type   -> LLM_BNB_4BIT_QUANT_TYPE
+#   weights.llm.bnb_4bit.double_quant -> LLM_BNB_4BIT_DOUBLE_QUANT
+#   weights.llm.bnb_4bit.compute_fp16 -> LLM_BNB_4BIT_COMPUTE_FP16
+#   weights.vision.bnb_4bit.quant_type   -> VISION_BNB_4BIT_QUANT_TYPE
+#   weights.vision.bnb_4bit.double_quant -> VISION_BNB_4BIT_DOUBLE_QUANT
+#   weights.vision.bnb_4bit.compute_fp16 -> VISION_BNB_4BIT_COMPUTE_FP16
+#   weights.cuda.force_reclaim_between_towers -> FORCE_RECLAIM_BETWEEN_TOWERS
+#   weights.bnb_modules_to_not_convert -> BNB_MODULES_TO_NOT_CONVERT（逗号分隔，可选）
 #   inference.use_cache               -> INFERENCE_USE_CACHE
 #   vision.dynamic_image_size         -> DYNAMIC_IMAGE_SIZE
 #   vision.strict_input_size          -> STRICT_VISION_INPUT_SIZE
@@ -49,8 +56,7 @@ prompt:
   # system_prompt_file -> SYSTEM_PROMPT_FILE：系统提示词文件在容器内的绝对路径。
   #                       与内联环境变量 SYSTEM_PROMPT 二选一；通常用文件便于维护。
   #                       可改为 /workspace/config/system_prompt.txt 等已挂载文件。
-  # system_prompt_file: /workspace/config/system_prompt_json.txt
-  system_prompt_file: /workspace/config/system_prompt.txt
+  system_prompt_file: /workspace/config/system_prompt_json.txt
 
   # json_score_in_user_prompt -> JSON_SCORE_IN_USER_PROMPT：
   #   true  — IAA/IQA/ISTA 由服务端先算分并写入用户侧消息再 chat，助手 JSON 前不再重复三行分数；
@@ -58,25 +64,79 @@ prompt:
   json_score_in_user_prompt: true
 
 # -----------------------------------------------------------------------------
-# weights — 权重量化（映射 WEIGHT_QUANT_MODE / BNB_4BIT_*）
+# logging — 服务调试日志（映射 ENABLE_DEBUG_LOG）
+# -----------------------------------------------------------------------------
+logging:
+  # enable_debug -> ENABLE_DEBUG_LOG：
+  #   true  — 输出中文 DEBUG 日志（模型加载、接口请求、模型运行链路）；
+  #   false — 仅保留现有 INFO/WARNING/ERROR 日志。
+  enable_debug: true
+
+# -----------------------------------------------------------------------------
+# weights — 权重量化（仅分塔配置）
 # -----------------------------------------------------------------------------
 weights:
-  # quant_mode -> WEIGHT_QUANT_MODE：bitsandbytes 加载策略。
-  #   none / off — 不量化（CUDA 下常为 bf16）；
-  #   8bit       — 8 比特量化（常用以省显存）；
-  #   4bit       — 4 比特量化（更省显存，建议配合较低 vision.input_size、
-  #               limits.max_new_tokens，并对质量做抽测）。
-  # 留空或不写时由代码默认决定（未设置等价于不通过该变量强制量化）。
-  quant_mode: 4bit # 8bit
+  # load_order -> WEIGHT_TOWER_LOAD_ORDER：双塔加载顺序控制（影响双次加载时的峰值显存与最终 reserved 形态）。
+  #   auto         — 默认：按量化档位自动决定 — 先加载更「省显存」的一塔（4bit → 8bit → 未量化）；
+  #                  两塔档位相同时先 vision 再 llm（与旧版同档行为一致）。
+  #   llm_first    — 强制先加载语言塔，再加载视觉塔；
+  #   vision_first — 强制先加载视觉塔，再加载语言塔。
+  # 未设置时等价于 auto。
+  # load_order: llm_first
+  # load_order: vision_first
+  load_order: auto
+  # llm.quant_mode -> WEIGHT_QUANT_MODE_LLM
+  # vision.quant_mode -> WEIGHT_QUANT_MODE_VISION
+  # 量化开关（两塔分别配置，互不影响）。
+  #
+  # quant_mode 可选值：
+  # - none / off：
+  #   不做 bitsandbytes 量化（全精度/半精度由模型与运行时决定），质量最好但显存占用最高。
+  # - 8bit / 8-bit：
+  #   使用 bitsandbytes 的 8-bit 加载（常见为 LLM.int8 类路径）；显存显著下降，速度通常接近原生，
+  #   但不同算子/硬件上可能略有质量或速度差异。
+  # - 4bit / 4-bit：
+  #   使用 bitsandbytes 的 4-bit 量化加载；显存进一步下降，但更依赖 GPU/算子支持，
+  #   且需要额外用 bnb_4bit.* 指定 4-bit 细节参数（见下）。
+  #
+  # 注意：
+  # - 量化主要影响「权重加载与推理显存/速度」，并不会改变接口协议；修改后需重启服务生效。
+  # - 4bit/8bit 依赖 bitsandbytes 与对应 CUDA 环境；在不支持的环境下可能会回退或直接报错（以日志为准）。
+  llm:
+    # 语言塔量化模式。
+    quant_mode: 4bit # 8bit
+    # bnb_4bit：仅当 quant_mode=4bit 时使用（bitsandbytes 4-bit 加载参数）。
+    bnb_4bit:
+      # quant_type：4-bit 量化格式。
+      # - nf4：NormalFloat4，实践中更常用、在同等显存下通常比 fp4 更稳。
+      # - fp4：Float4，部分场景可能更快/更兼容但精度波动更大。
+      quant_type: nf4
+      # double_quant：是否启用「二次量化」（把量化常数再压缩），进一步省显存，通常对质量影响较小。
+      double_quant: true
+      # compute_fp16：4-bit 权重量化后，矩阵乘等计算使用 FP16（true）还是更高精度（如 BF16/FP32，取决于实现）。
+      # 一般情况下：true 更省显存/更快；若遇到数值不稳定或不支持，可尝试关闭并结合硬件能力调整。
+      compute_fp16: true
+  vision:
+    quant_mode: 8bit # 8bit
+    # bnb_4bit：仅当 quant_mode=4bit 时使用（与 llm.bnb_4bit 含义一致，但可独立设置）。
+    bnb_4bit:
+      quant_type: nf4
+      double_quant: true
+      compute_fp16: true
 
-  # bnb_4bit：仅当 quant_mode 为 4bit 时由 BitsAndBytesConfig 使用；8bit 时下列项无效果，可保留作切换 4bit 时的模板。
-  bnb_4bit:
-    # quant_type -> BNB_4BIT_QUANT_TYPE：4bit 量化类型，常用 nf4。
-    quant_type: nf4
-    # double_quant -> BNB_4BIT_DOUBLE_QUANT：是否嵌套双量化（更省显存，略增计算开销）。
-    double_quant: false
-    # compute_fp16 -> BNB_4BIT_COMPUTE_FP16：反量化/矩阵乘是否在 fp16 上算；false 时多为 bf16。
-    compute_fp16: true
+  # cuda：与「权重加载」相关的 CUDA 行为（不影响量化数值本身）。
+  cuda:
+    # force_reclaim_between_towers -> FORCE_RECLAIM_BETWEEN_TOWERS：
+    #   双塔分两次加载时，在第一塔完成后、第二塔开始前强制执行一次 CUDA reclaim（empty_cache 等），
+    #   用于压低峰值/碎片导致的 reserved；关闭时仍遵循 INFERENCE_RECLAIM_BETWEEN_STAGES 的轻量 reclaim。
+    #   仅由本项（或同名环境变量）控制，与 logging.enable_debug / ENABLE_DEBUG_LOG 无关。
+    force_reclaim_between_towers: true
+
+  # bnb_modules_to_not_convert -> BNB_MODULES_TO_NOT_CONVERT
+  # 逗号分隔的额外跳过前缀；会分别合并到 llm/vision 加载阶段的默认跳过集合。
+  # bnb_modules_to_not_convert: "vision_model.some_block,language_model.model.layers.0"
+
+  # 说明：即使 llm/vision 量化模式相同，服务也会按两塔独立读取各自 bnb_4bit 参数。
 
 # -----------------------------------------------------------------------------
 # inference — 生成行为（映射 INFERENCE_USE_CACHE）

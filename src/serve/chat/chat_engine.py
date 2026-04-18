@@ -12,7 +12,7 @@ from transformers.generation.streamers import TextIteratorStreamer
 
 from internvl.conversation import get_conv_template
 
-from ..runtime.env_utils import _env_bool, _maybe_cuda_reclaim
+from ..runtime.env_utils import _debug_log_enabled, _env_bool, _maybe_cuda_reclaim
 from ..openai_types import ChatCompletionRequest
 from ..runtime.state import STATE, _raise_if_model_unavailable
 
@@ -150,6 +150,8 @@ def _compute_score_block(
         raise RuntimeError("Model is not loaded")
     values: Dict[str, float] = {}
     out_lines: List[str] = []
+    if _debug_log_enabled() and logger.isEnabledFor(logging.DEBUG):
+        logger.debug("开始计算评分分块，metrics=%s", ",".join(metrics))
     with torch.no_grad():
         visual_features = STATE.model.extract_feature(pixel_values)
     for metric in metrics:
@@ -174,6 +176,8 @@ def _compute_score_block(
             _maybe_cuda_reclaim(stage=f"score_{metric}")
     del visual_features
     _maybe_cuda_reclaim(stage="score_all_done")
+    if _debug_log_enabled() and logger.isEnabledFor(logging.DEBUG):
+        logger.debug("评分分块计算完成，成功项=%s", len(values))
     return "\n".join(out_lines) + "\n", values
 
 
@@ -232,7 +236,17 @@ def _merge_request_generation_config(body: ChatCompletionRequest) -> Dict[str, A
         gen.manual_seed(sd & 0xFFFFFFFF)
         cfg["generator"] = gen
 
-    return {k: v for k, v in cfg.items() if v is not None}
+    merged = {k: v for k, v in cfg.items() if v is not None}
+    if _debug_log_enabled() and logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "请求生成参数合并完成：do_sample=%s temperature=%s top_p=%s max_new_tokens=%s has_generator=%s",
+            merged.get("do_sample"),
+            merged.get("temperature"),
+            merged.get("top_p"),
+            merged.get("max_new_tokens"),
+            "generator" in merged,
+        )
+    return merged
 
 
 def _iter_tokens_via_streamer(
@@ -266,5 +280,7 @@ def _iter_tokens_via_streamer(
             )
 
     gen_thread = Thread(target=_run_generate, daemon=True)
+    if _debug_log_enabled() and logger.isEnabledFor(logging.DEBUG):
+        logger.debug("流式生成线程启动：history_len=%s has_pixel_values=%s", len(history), pixel_values is not None)
     gen_thread.start()
     return streamer, gen_thread

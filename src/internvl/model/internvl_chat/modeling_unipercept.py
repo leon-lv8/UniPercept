@@ -43,6 +43,10 @@ def _inference_use_cache_default() -> bool:
     return _env_bool("INFERENCE_USE_CACHE", True)
 
 
+def _debug_log_enabled() -> bool:
+    return _env_bool("ENABLE_DEBUG_LOG", False)
+
+
 def version_cmp(v1, v2, op='eq'):
     import operator
 
@@ -61,7 +65,19 @@ class InternVLChatModel(PreTrainedModel):
     _supports_flash_attn_2 = True
     supports_gradient_checkpointing = True
 
-    def __init__(self, config: InternVLChatConfig, vision_model=None, language_model=None, use_flash_attn=True):
+    def __init__(
+        self,
+        config: InternVLChatConfig,
+        vision_model=None,
+        language_model=None,
+        use_flash_attn=True,
+        **kwargs,
+    ):
+        # bitsandbytes / from_pretrained may leave loading-only kwargs on the stack that must not
+        # reach nn.Module.__init__ (e.g. modules_to_not_convert is consumed during weight init).
+        kwargs.pop("modules_to_not_convert", None)
+        if kwargs:
+            logger.warning("InternVLChatModel.__init__ ignoring unexpected kwargs: %s", sorted(kwargs.keys()))
         super().__init__(config)
 
         assert version_cmp(transformers.__version__, '4.37.0', 'ge')
@@ -386,6 +402,13 @@ class InternVLChatModel(PreTrainedModel):
              IMG_END_TOKEN='</img>',
              IMG_CONTEXT_TOKEN='<IMG_CONTEXT>',
              verbose=False):
+        if _debug_log_enabled() and logger.isEnabledFor(10):
+            logger.debug(
+                "模型 chat 开始：has_pixel_values=%s history_len=%s return_history=%s",
+                pixel_values is not None,
+                0 if history is None else len(history),
+                return_history,
+            )
 
         if history is None and pixel_values is not None and '<image>' not in question:
             question = '<image>\n' + question
@@ -436,6 +459,8 @@ class InternVLChatModel(PreTrainedModel):
 
             response = repair_assistant_json_corruption(response)
         history.append((question, response))
+        if _debug_log_enabled() and logger.isEnabledFor(10):
+            logger.debug("模型 chat 完成：response_chars=%s", len(response))
 
         if return_history:
             return response, history
@@ -459,6 +484,8 @@ class InternVLChatModel(PreTrainedModel):
             IMG_END_TOKEN='</img>',
             IMG_CONTEXT_TOKEN='<IMG_CONTEXT>',
             verbose=False):
+        if _debug_log_enabled() and logger.isEnabledFor(10):
+            logger.debug("模型 score 开始：desc=%s has_visual_features=%s", desc, visual_features is not None)
 
         question = f"<image>Rate the {desc} score of the image in 0-100. In the output format, numbers are replaced by 2 corresponding letters, and the mapping relationship is: score 0 to 25: 0-aa, 1-ab, 2-ac, 3-ad, ... , 25-az, \nscore 26 to 50: 26-ca, 27-cb, 28-cc, 29-cd, ..., 50-cy, \nscore 51 to 75: 51-da, 52-db, 53-dc, 54-dd, ..., 75-dy, \nscore 76 to 100: 76-ea, 77-eb, 73-ec, 74-ed, ..., 100-ey. \nThe answer only outputs 2 corresponding letters."
 
@@ -513,6 +540,8 @@ class InternVLChatModel(PreTrainedModel):
         weight_tensor = torch.tensor([x for x in range(101)]).to(device)
 
         score = torch.softmax(output_logits, -1) @ weight_tensor.to(output_logits.dtype)
+        if _debug_log_enabled() and logger.isEnabledFor(10):
+            logger.debug("模型 score 完成：score=%.4f", score.item())
         return score.item()
 
 
@@ -527,6 +556,12 @@ class InternVLChatModel(PreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         **generate_kwargs,
     ) -> torch.LongTensor:
+        if _debug_log_enabled() and logger.isEnabledFor(10):
+            logger.debug(
+                "模型 generate 开始：has_pixel_values=%s use_cache=%s",
+                pixel_values is not None,
+                _inference_use_cache_default(),
+            )
 
         assert self.img_context_token_id is not None
         if pixel_values is not None:
@@ -564,6 +599,8 @@ class InternVLChatModel(PreTrainedModel):
             use_cache=_inference_use_cache_default(),
             **generate_kwargs,
         )
+        if _debug_log_enabled() and logger.isEnabledFor(10):
+            logger.debug("模型 generate 完成：batch_size=%s", int(outputs.shape[0]) if outputs is not None else -1)
 
         return outputs
 
@@ -578,6 +615,12 @@ class InternVLChatModel(PreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         **generate_kwargs,
     ) -> torch.LongTensor:
+        if _debug_log_enabled() and logger.isEnabledFor(10):
+            logger.debug(
+                "模型 generate_logits 开始：has_pixel_values=%s use_cache=%s",
+                pixel_values is not None,
+                _inference_use_cache_default(),
+            )
 
         assert self.img_context_token_id is not None
         if pixel_values is not None:
@@ -615,6 +658,8 @@ class InternVLChatModel(PreTrainedModel):
             output_hidden_states=effective_output_hidden_states,
             return_dict=True,
         )
+        if _debug_log_enabled() and logger.isEnabledFor(10):
+            logger.debug("模型 generate_logits 完成：logits_shape=%s", tuple(outputs.logits.shape))
 
         return outputs
 

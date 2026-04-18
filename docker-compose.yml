@@ -58,7 +58,7 @@ services:
     image: unipercept-openai:latest
     container_name: unipercept-openai-gpu
     ports:
-      - "18000:8000"
+      - "8000:8000"
     environment:
       # 分层级运行时 YAML（挂载见下方 volumes ./config）；服务启动时映射为环境变量
       RUNTIME_CONFIG_FILE: /workspace/config/runtime.yaml

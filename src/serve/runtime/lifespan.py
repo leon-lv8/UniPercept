@@ -7,8 +7,7 @@ from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
 
-from .env_utils import _select_device
-from .model_load import _load_model_worker
+from .env_utils import _debug_log_enabled, _select_device
 from .state import STATE
 
 logger = logging.getLogger(__name__)
@@ -33,7 +32,13 @@ async def lifespan(app: FastAPI):
 
     async def _run_load() -> None:
         try:
+            from .model_load import _load_model_worker
+
+            if _debug_log_enabled() and logger.isEnabledFor(logging.DEBUG):
+                logger.debug("后台模型加载任务已启动")
             await asyncio.to_thread(_load_model_worker, app)
+            if _debug_log_enabled() and logger.isEnabledFor(logging.DEBUG):
+                logger.debug("后台模型加载任务已结束")
         except Exception:
             logger.exception("Background model load task raised")
             if STATE.model_load_error is None:

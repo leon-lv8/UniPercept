@@ -57,17 +57,47 @@ def _mapping_pairs(data: Mapping[str, Any]) -> List[Tuple[str, str]]:
     if "json_score_in_user_prompt" in prompt:
         out.append(("JSON_SCORE_IN_USER_PROMPT", _as_env_str(prompt["json_score_in_user_prompt"])))
 
+    logging_cfg = section("logging")
+    if "enable_debug" in logging_cfg:
+        out.append(("ENABLE_DEBUG_LOG", _as_env_str(logging_cfg["enable_debug"])))
+
     weights = section("weights")
-    if "quant_mode" in weights:
-        out.append(("WEIGHT_QUANT_MODE", _as_env_str(weights["quant_mode"])))
-    bnb = weights.get("bnb_4bit")
-    if isinstance(bnb, Mapping):
-        if "quant_type" in bnb:
-            out.append(("BNB_4BIT_QUANT_TYPE", _as_env_str(bnb["quant_type"])))
-        if "double_quant" in bnb:
-            out.append(("BNB_4BIT_DOUBLE_QUANT", _as_env_str(bnb["double_quant"])))
-        if "compute_fp16" in bnb:
-            out.append(("BNB_4BIT_COMPUTE_FP16", _as_env_str(bnb["compute_fp16"])))
+    if "load_order" in weights:
+        out.append(("WEIGHT_TOWER_LOAD_ORDER", _as_env_str(weights["load_order"])))
+    llm = weights.get("llm")
+    if isinstance(llm, Mapping) and "quant_mode" in llm:
+        out.append(("WEIGHT_QUANT_MODE_LLM", _as_env_str(llm["quant_mode"])))
+    llm_bnb = llm.get("bnb_4bit") if isinstance(llm, Mapping) else None
+    if isinstance(llm_bnb, Mapping):
+        if "quant_type" in llm_bnb:
+            out.append(("LLM_BNB_4BIT_QUANT_TYPE", _as_env_str(llm_bnb["quant_type"])))
+        if "double_quant" in llm_bnb:
+            out.append(("LLM_BNB_4BIT_DOUBLE_QUANT", _as_env_str(llm_bnb["double_quant"])))
+        if "compute_fp16" in llm_bnb:
+            out.append(("LLM_BNB_4BIT_COMPUTE_FP16", _as_env_str(llm_bnb["compute_fp16"])))
+    vision_q = weights.get("vision")
+    if isinstance(vision_q, Mapping) and "quant_mode" in vision_q:
+        out.append(("WEIGHT_QUANT_MODE_VISION", _as_env_str(vision_q["quant_mode"])))
+    vision_bnb = vision_q.get("bnb_4bit") if isinstance(vision_q, Mapping) else None
+    if isinstance(vision_bnb, Mapping):
+        if "quant_type" in vision_bnb:
+            out.append(("VISION_BNB_4BIT_QUANT_TYPE", _as_env_str(vision_bnb["quant_type"])))
+        if "double_quant" in vision_bnb:
+            out.append(("VISION_BNB_4BIT_DOUBLE_QUANT", _as_env_str(vision_bnb["double_quant"])))
+        if "compute_fp16" in vision_bnb:
+            out.append(("VISION_BNB_4BIT_COMPUTE_FP16", _as_env_str(vision_bnb["compute_fp16"])))
+    cuda_w = weights.get("cuda")
+    if isinstance(cuda_w, Mapping):
+        if "force_reclaim_between_towers" in cuda_w:
+            out.append(("FORCE_RECLAIM_BETWEEN_TOWERS", _as_env_str(cuda_w["force_reclaim_between_towers"])))
+    if "bnb_modules_to_not_convert" in weights:
+        bnb_skip = weights["bnb_modules_to_not_convert"]
+        if isinstance(bnb_skip, (list, tuple)):
+            out.append(
+                ("BNB_MODULES_TO_NOT_CONVERT", ",".join(_as_env_str(x) for x in bnb_skip))
+            )
+        else:
+            out.append(("BNB_MODULES_TO_NOT_CONVERT", _as_env_str(bnb_skip)))
 
     inf = section("inference")
     if "use_cache" in inf:
@@ -111,8 +141,24 @@ def apply_runtime_yaml_to_environ() -> None:
     if not isinstance(raw, Mapping):
         logger.warning("Runtime YAML at %s is not a mapping; skipping", path)
         return
+    _validate_no_legacy_weight_keys(raw)
 
     pairs = _mapping_pairs(raw)
     for key, val in pairs:
         os.environ[key] = val
     logger.info("Applied runtime YAML -> os.environ (%d keys) from %s", len(pairs), path)
+
+
+def _validate_no_legacy_weight_keys(data: Mapping[str, Any]) -> None:
+    weights = data.get("weights")
+    if not isinstance(weights, Mapping):
+        return
+    deprecated = [k for k in ("quant_mode", "quant_scope", "bnb_4bit") if k in weights]
+    if not deprecated:
+        return
+    raise RuntimeError(
+        "Legacy weights keys are no longer supported: %s. "
+        "Please migrate to weights.llm.quant_mode, weights.vision.quant_mode, "
+        "weights.llm.bnb_4bit.*, and weights.vision.bnb_4bit.*."
+        % ", ".join(deprecated)
+    )

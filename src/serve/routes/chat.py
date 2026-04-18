@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 import uuid
 from typing import AsyncGenerator, Dict, List, Optional
 
@@ -22,22 +24,32 @@ from ..chat.chat_engine import (
     _sse_event,
     _strip_leading_hallucinated_score_tail,
 )
-from ..runtime.env_utils import _env_bool, _maybe_cuda_reclaim, _now_ts
+from ..runtime.env_utils import _debug_log_enabled, _env_bool, _maybe_cuda_reclaim, _now_ts
 from ..chat.openai_messages import _messages_to_chat_inputs
 from ..openai_types import ChatCompletionRequest, ChatCompletionResponse
 from ..runtime.state import STATE, _raise_if_model_unavailable
 from ..runtime.vision_input import _pixel_dtype
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.post("/v1/chat/completions")
 async def chat_completions(req: Request):
+    request_t0 = time.time()
     body: ChatCompletionRequest = await req.json()
     model_name = body.get("model") or STATE.model_id
     messages = body.get("messages") or []
     stream = bool(body.get("stream", False))
     request_max_tokens = body.get("max_tokens")
+    if _debug_log_enabled() and logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "收到聊天请求：stream=%s messages=%s max_tokens=%s model=%s",
+            stream,
+            len(messages) if isinstance(messages, list) else -1,
+            request_max_tokens,
+            model_name,
+        )
 
     _raise_if_model_unavailable()
 
@@ -73,6 +85,13 @@ async def chat_completions(req: Request):
         and _question_is_visual_only_placeholder(question)
         and not json_score_in_user
     )
+    if _debug_log_enabled() and logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "请求分支：score_metrics=%s json_score_in_user=%s skip_chat_after_score=%s",
+            bool(score_metrics),
+            json_score_in_user,
+            skip_chat_after_score,
+        )
 
     def _pixels_to_device(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         if t is None:
@@ -135,6 +154,8 @@ async def chat_completions(req: Request):
 
     if not stream:
         text = _repair_assistant_json_corruption(await run_infer())
+        if _debug_log_enabled() and logger.isEnabledFor(logging.DEBUG):
+            logger.debug("非流式请求完成，耗时=%.3fs", time.time() - request_t0)
         resp: ChatCompletionResponse = {
             "id": resp_id,
             "object": "chat.completion",
@@ -275,5 +296,7 @@ async def chat_completions(req: Request):
             }
         )
         yield _sse_done()
+        if _debug_log_enabled() and logger.isEnabledFor(logging.DEBUG):
+            logger.debug("流式请求完成，耗时=%.3fs", time.time() - request_t0)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

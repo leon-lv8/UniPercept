@@ -4,19 +4,17 @@ import asyncio
 import logging
 from typing import Any, Dict, Optional
 
-import torch
 from fastapi import HTTPException
-
-from internvl.model.internvl_chat.modeling_unipercept import InternVLChatModel
 
 logger = logging.getLogger(__name__)
 
 
 class _State:
-    model: Optional[InternVLChatModel] = None
+    # Loaded lazily in model_load; keep this module import-light so startup does not pull torch / huge models.
+    model: Optional[Any] = None
     tokenizer: Optional[object] = None
     gen_cfg: Optional[Dict[str, Any]] = None
-    device: Optional[torch.device] = None
+    device: Optional[Any] = None
     model_id: str = "unipercept"
     model_path: str = ""
     model_list_created: int = 0
