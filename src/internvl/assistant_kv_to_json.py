@@ -178,10 +178,24 @@ def _parse_flat_kv(body: str) -> Dict[str, str]:
             else:
                 logger.warning("assistant_kv: skipped line with invalid key: %r", raw_line[:120])
             continue
+        key = _normalize_common_misspelled_keys(key)
         out[key] = val
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug("assistant_kv _parse_flat_kv: parsed_keys=%s", len(out))
     return out
+
+
+def _normalize_common_misspelled_keys(key: str) -> str:
+    # Keep this mapping intentionally conservative: only normalize high-frequency
+    # model typos that are known to cause schema field loss.
+    aliases = {
+        "aesthetic.lightlight": "aesthetic.lighting",
+        "aesthetic.strength": "aesthetic.strengths",
+        "aesthetic.weeknesses": "aesthetic.weaknesses",
+        "aesthetic.weakness": "aesthetic.weaknesses",
+        "aesthetic.weaknesss": "aesthetic.weaknesses",
+    }
+    return aliases.get(key, key)
 
 
 def _parse_bool_token(s: str) -> Optional[bool]:

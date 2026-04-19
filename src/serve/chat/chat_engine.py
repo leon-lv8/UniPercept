@@ -180,6 +180,8 @@ def _score_block_for_user_prompt(score_block: str) -> str:
         "【以下为服务端已确定的 IAA/IQA/ISTA 评分，请在 BEGIN/END 块内使用扁平键 "
         "aesthetic.scores.iaa、aesthetic.scores.iqa、aesthetic.scores.ista 填入与下列完全一致的数值"
         "（保留一位或两位小数均可，但必须与下列分数一致）；不得改写或另造分数。】\n"
+        "【键名与格式硬约束】评分键名必须逐字正确（禁止 iaaa/iqaa 等变体），"
+        "数组字段必须使用 | 分隔，BEGIN/END 标记必须精确拼写。\n"
         "【一致性硬约束】既然已有上述评分，表示图像已被成功观测："
         "meta.image_observed 必须为 true；"
         "禁止输出 task_type=refusal 且 refusal_reason 为“图像无效/图像不可见/无效图片”等同义理由。"

@@ -93,6 +93,13 @@ image_annotation.*（当 image_annotation 为对象时全部必填）：
 - refusal 之外 refusal_reason 必须为 null。
 - summary、reasoning_brief、limitations 与 task_type 语义自洽。
 
+【高频错误红线（必须避免）】
+- `aesthetic.weaknesses` 必须精确拼写，禁止写成 `aesthetic.weaknesss`、`aesthetic.weeknesses`、`aesthetic.weakness`、`weekness` 等变体。
+- `aesthetic.lighting` 必须精确拼写，禁止写成 `aesthetic.lightlight`。
+- 数组字段 `image_annotation.tags`、`aesthetic.strengths`、`aesthetic.weaknesses` 必须使用 `|` 分隔，禁止仅用英文逗号 `,` 或中文逗号 `，`。
+- 结束标记必须且只能是 `END_UNIPERCEPT_KV`；禁止 `END_UNIPPERCEPT_KV` 等拼写错误。
+- 键名中禁止出现多余前缀或空格（例如 `a aesthetic.color`），否则该行会被解析器忽略并导致字段缺失。
+
 ---
 
 【完整样例（task_type=aesthetic_analysis）】
@@ -121,6 +128,78 @@ image_annotation.category_secondary: 街头人像
 image_annotation.tags: 夜景人像|霓虹灯|城市街道|浅景深|冷暖对比
 image_annotation.description_short: 画面展示一位人物在夜间城市街道中的半身人像，背景有霓虹与车流光斑。
 image_annotation.description_detailed: 主体人物位于画面左侧，面向镜头附近区域，表情平静。背景为夜间街道与虚化灯牌，形成明显空间层次。可见多处霓虹光源和车辆光轨，环境具有都市氛围。人物衣着深色，轮廓边缘受侧后方光源勾勒。整体场景以人像表达为主，同时保留了环境叙事信息。
+image_annotation.ocr_text: null
+image_annotation.safety_flags.adult: false
+image_annotation.safety_flags.violence: false
+image_annotation.safety_flags.medical: false
+image_annotation.safety_flags.sensitive: false
+meta.language: zh-CN
+meta.image_observed: true
+meta.notes: 无
+END_UNIPERCEPT_KV
+
+【完整反例（禁止输出，以下仅用于识别错误）】
+BEGIN_UNIPERCEPT_KV
+schema_version: 1.1
+task_type: aesthetic_analysis
+confidence: medium
+summary: 树枝与红果构图自然。
+reasoning_brief: 色彩对比明显，但细节有损失。
+limitations: null
+refusal_reason: null
+aesthetic.scores.iaa: 55.25
+aesthetic.scores.iqa: 65.00
+aesthetic.scores.ista: 52.00
+aesthetic.subject_and_content: 树枝与红果，蓝天背景。
+aesthetic.composition: 画面平衡，主体分布自然。
+aesthetic.lightlight: 光线较均匀。
+aesthetic.color: 红果与蓝天对比明显。
+aesthetic.sharpness_and_noise: 局部细节略软。
+aesthetic.mood_and_narrative: 氛围宁静，季节感较强。
+aesthetic.technical_issues_and_suggestions: 建议微调锐化并控制高光。
+aesthetic.strengths: 色彩鲜明,主体明确
+aesthetic.weaknesss: 暗部细节不足,局部锐度偏低
+image_annotation.category_primary: 风景
+image_annotation.category_secondary: 枝头果实
+image_annotation.tags: 自然风景,红果,树枝,蓝天背景
+image_annotation.description_short: 树枝与红果在蓝天下形成自然构图。
+image_annotation.description_detailed: 枝条交错，红果分布在不同层次。蓝天作为背景提供清爽反差。主体易于识别，但局部细节略显松散。整体观感自然且有季节气息。
+image_annotation.ocr_text: null
+image_annotation.safety_flags.adult: false
+image_annotation.safety_flags.violence: false
+image_annotation.safety_flags.medical: false
+image_annotation.safety_flags.sensitive: false
+meta.language: zh-CN
+meta.image_observed: true
+meta.notes: 无
+END_UNIPPERCEPT_KV
+
+【对应正例（可参考）】
+BEGIN_UNIPERCEPT_KV
+schema_version: 1.1
+task_type: aesthetic_analysis
+confidence: medium
+summary: 树枝与红果构图自然，色彩对比清晰，技术表现中等。
+reasoning_brief: 主体分布均衡，红蓝对比增强观感；但局部细节与暗部层次仍有提升空间。
+limitations: null
+refusal_reason: null
+aesthetic.scores.iaa: 55.25
+aesthetic.scores.iqa: 65.00
+aesthetic.scores.ista: 52.00
+aesthetic.subject_and_content: 树枝交错延展，红果点缀其间，背景为晴朗蓝天。
+aesthetic.composition: 树枝形成自然引导线，果实在画面中分布均匀，整体重心稳定。
+aesthetic.lighting: 自然光照较柔和，主体曝光基本稳定，暗部细节略有压缩。
+aesthetic.color: 红果与蓝天形成高辨识度对比，整体色彩鲜明且协调。
+aesthetic.sharpness_and_noise: 主体整体可辨，局部边缘存在轻微软化，噪点不明显。
+aesthetic.mood_and_narrative: 画面传达宁静自然的季节感，叙事以静态观察为主。
+aesthetic.technical_issues_and_suggestions: 可适度提升局部对比与锐度，并在后期轻微提亮暗部以增强层次。
+aesthetic.strengths: 红蓝对比明确且吸睛|自然构图舒展且观感舒适
+aesthetic.weaknesses: 局部边缘细节偏软|暗部层次表现略弱
+image_annotation.category_primary: 风景
+image_annotation.category_secondary: 枝头果实
+image_annotation.tags: 自然风景|红果|树枝|蓝天背景|季节感
+image_annotation.description_short: 树枝与红果在蓝天下形成清晰且自然的视觉主体。
+image_annotation.description_detailed: 多条树枝在画面中交错延展，红果分布在枝条节点处。背景天空色调纯净，为主体提供了明确反差。主体识别度较高，整体构图偏均衡稳定。局部细节表现一般，但不影响主要内容理解。画面整体传递出安静、自然的季节氛围。
 image_annotation.ocr_text: null
 image_annotation.safety_flags.adult: false
 image_annotation.safety_flags.violence: false
