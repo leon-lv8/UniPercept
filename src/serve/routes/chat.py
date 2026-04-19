@@ -15,7 +15,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from transformers import StoppingCriteria, StoppingCriteriaList
 
-from internvl.assistant_kv_to_json import assistant_kv_text_to_obj
+from internvl.assistant_kv_to_json import assistant_kv_text_to_obj, sanitize_model_text
 
 from ..chat.chat_engine import (
     _auto_score_metrics,
@@ -236,6 +236,12 @@ async def chat_completions(req: Request):
         return t.to(STATE.device, dtype=_pixel_dtype(STATE.device))  # type: ignore[arg-type]
 
     disconnect_grace_sec = float(os.environ.get("DISCONNECT_CANCEL_GRACE_SEC", "3"))
+    prompt_debug: Dict[str, Any] = {
+        "question_user_raw": question,
+        "question_for_model": question,
+        "score_block": "",
+        "score_injection_applied": False,
+    }
 
     def _run_infer_sync(stop_event: threading.Event) -> str:
         with torch.no_grad():
@@ -253,6 +259,9 @@ async def chat_completions(req: Request):
                 if json_score_in_user and score_block
                 else question
             )
+            prompt_debug["question_for_model"] = question_eff
+            prompt_debug["score_block"] = score_block
+            prompt_debug["score_injection_applied"] = bool(json_score_in_user and score_block)
             chat_generation_config = dict(generation_config)
             chat_generation_config["stopping_criteria"] = StoppingCriteriaList(
                 [_DisconnectStoppingCriteria(stop_event)]
@@ -334,8 +343,9 @@ async def chat_completions(req: Request):
             return await infer_task
 
     raw_text = await run_infer()
+    sanitized_text = sanitize_model_text(raw_text)
     if _debug_log_enabled() and logger.isEnabledFor(logging.DEBUG):
-        rt = raw_text.strip()
+        rt = sanitized_text.strip()
         lines = rt.splitlines()
         logger.debug(
             "chat 路由 KV 解析入参（与 model.chat 解码输出一致）: len=%s line_count=%s starts_BEGIN=%s "
@@ -347,12 +357,20 @@ async def chat_completions(req: Request):
             (lines[0][:220] if lines else ""),
             rt.replace("\n", "⏎")[:420],
         )
-    out_obj = assistant_kv_text_to_obj(raw_text)
+    out_obj = assistant_kv_text_to_obj(sanitized_text)
     out_obj = _normalize_score_branch_refusal(out_obj, score_metrics=score_metrics)
     if _debug_log_enabled():
+        sys_prompt = str(getattr(STATE.model, "system_message", "") or "")
         dbg: Dict[str, Any] = {
             "request": _debug_redact_value(dict(body)),
-            "model_output_text": _debug_model_output_text(raw_text),
+            "system_prompt": _debug_redact_string(sys_prompt),
+            "prompt_to_model": {
+                "question_user_raw": _debug_redact_string(str(prompt_debug.get("question_user_raw", ""))),
+                "question_for_model": _debug_redact_string(str(prompt_debug.get("question_for_model", ""))),
+                "score_block": _debug_redact_string(str(prompt_debug.get("score_block", ""))),
+                "score_injection_applied": bool(prompt_debug.get("score_injection_applied")),
+            },
+            "model_output_text": _debug_model_output_text(sanitized_text),
         }
         out_obj = {**out_obj, "_debug": dbg}
     text = json.dumps(out_obj, ensure_ascii=False)
@@ -360,7 +378,7 @@ async def chat_completions(req: Request):
     if _debug_log_enabled() and logger.isEnabledFor(logging.DEBUG):
         logger.debug(
             "输出收敛：raw_len=%s json_len=%s",
-            len(raw_text.strip()),
+            len(sanitized_text.strip()),
             repaired_len,
         )
     if _debug_log_enabled() and logger.isEnabledFor(logging.DEBUG):

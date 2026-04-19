@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import unicodedata
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,37 @@ def _one_line_preview(s: str, max_len: int = 360) -> str:
     return t
 
 
+def sanitize_model_text(raw: str) -> str:
+    """
+    Unified text sanitation for model output before KV parsing.
+    - Drop BOM/zero-width markers.
+    - Normalize CRLF/CR to LF.
+    - Remove control/format chars except LF/TAB.
+    - Replace common curly/fullwidth quotes with ASCII.
+    """
+    if not raw:
+        return raw
+    t = raw.lstrip("\ufeff\u200b\u200e\u200f")
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+    t = (
+        t.replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\uff02", '"')
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+    )
+    cleaned: List[str] = []
+    for ch in t:
+        cat = unicodedata.category(ch)
+        if ch in ("\n", "\t"):
+            cleaned.append(ch)
+            continue
+        if cat in ("Cc", "Cf"):
+            continue
+        cleaned.append(ch)
+    return "".join(cleaned)
+
+
 def _unescape_kv_value(s: str) -> str:
     return s.replace("\\n", "\n").replace("\\t", "\t").replace("\\\\", "\\")
 
@@ -91,7 +123,10 @@ def _scrub_stray_suffix_quotes(s: str) -> str:
 def _sanitize_nl_value(s: str) -> str:
     if not isinstance(s, str):
         return ""
-    return _scrub_stray_suffix_quotes(_unescape_kv_value(s.strip()))
+    # 模型/链路偶发输出 Unicode replacement char（� / U+FFFD），会污染文案与标签。
+    # 这里仅做清洗，不做语义替换。
+    t = _unescape_kv_value(s.strip()).replace("\ufffd", "")
+    return _scrub_stray_suffix_quotes(t)
 
 
 def _normalize_category_primary(cp: str) -> str:
@@ -176,7 +211,12 @@ def _parse_pipe_list(s: str) -> List[str]:
     t = _unescape_kv_value(s.strip())
     if not t or t == "[]":
         return []
-    return [p.strip() for p in t.split("|") if p.strip()]
+    if "|" in t:
+        parts = t.split("|")
+    else:
+        # 模型偶发用逗号分隔 tags/strengths/weaknesses，这里做兼容切分。
+        parts = re.split(r"[,\uFF0C\u3001]+", t)
+    return [p.strip() for p in parts if p.strip()]
 
 
 def _deep_set(target: Dict[str, Any], dotted: str, leaf: Any) -> None:
@@ -545,7 +585,7 @@ def flat_kv_to_root_object(flat: Dict[str, str]) -> Tuple[Optional[Dict[str, Any
 
 
 def assistant_kv_text_to_obj(text: str) -> Dict[str, Any]:
-    raw = text.lstrip("\ufeff\u200b\u200e\u200f")
+    raw = sanitize_model_text(text)
     stripped = raw.strip()
     lines = stripped.splitlines()
     first_nl = lines[0] if lines else ""
