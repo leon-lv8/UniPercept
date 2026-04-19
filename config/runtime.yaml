@@ -17,6 +17,8 @@
 #   serve.prefer_cuda                 -> PREFER_CUDA
 #   prompt.system_prompt_file         -> SYSTEM_PROMPT_FILE
 #   logging.enable_debug              -> ENABLE_DEBUG_LOG
+#   logging.debug_response.plain_string_max -> DEBUG_RESPONSE_PLAIN_STRING_MAX
+#   logging.debug_response.model_output_max_chars -> DEBUG_RESPONSE_MODEL_OUTPUT_MAX_CHARS
 #   weights.llm.quant_mode            -> WEIGHT_QUANT_MODE_LLM
 #   weights.vision.quant_mode         -> WEIGHT_QUANT_MODE_VISION
 #   weights.llm.bnb_4bit.quant_type   -> LLM_BNB_4BIT_QUANT_TYPE
@@ -57,8 +59,8 @@ serve:
 prompt:
   # system_prompt_file -> SYSTEM_PROMPT_FILE：系统提示词文件在容器内的绝对路径。
   #                       与内联环境变量 SYSTEM_PROMPT 二选一；通常用文件便于维护。
-  #                       默认建议使用严格 JSON 版本提示词。
-  system_prompt_file: /workspace/config/system_prompt_json.txt
+  #                       默认使用行式 KV 输出契约（服务端再组装为 JSON）。
+  system_prompt_file: /workspace/config/system_prompt_kv.txt
 
 # -----------------------------------------------------------------------------
 # logging — 服务调试日志（映射 ENABLE_DEBUG_LOG）
@@ -68,6 +70,13 @@ logging:
   #   true  — 输出中文 DEBUG 日志（模型加载、接口请求、模型运行链路）；
   #   false — 仅保留现有 INFO/WARNING/ERROR 日志。
   enable_debug: true
+
+  # debug_response：当 ENABLE_DEBUG_LOG=true 时，接口返回 JSON 中 _debug 字段的体积控制（映射同名环境变量）。
+  debug_response:
+    # plain_string_max -> DEBUG_RESPONSE_PLAIN_STRING_MAX：入参快照里「普通长字符串」最多保留的字符数（data:...;base64 仅输出 mime+decoded_bytes，不占此额度）。
+    plain_string_max: 8192
+    # model_output_max_chars -> DEBUG_RESPONSE_MODEL_OUTPUT_MAX_CHARS：_debug.model_output_text 最大字符数，超出截断。
+    model_output_max_chars: 500000
 
 # -----------------------------------------------------------------------------
 # weights — 权重量化（仅分塔配置）

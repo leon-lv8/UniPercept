@@ -1,25 +1,27 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
-from typing import AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import torch
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from transformers import StoppingCriteria, StoppingCriteriaList
 
-from internvl.json_assistant_repair import repair_assistant_json_corruption as _repair_assistant_json_corruption
+from internvl.assistant_kv_to_json import assistant_kv_text_to_obj
 
 from ..chat.chat_engine import (
     _auto_score_metrics,
     _compute_score_block,
     _merge_request_generation_config,
-    _question_with_json_score_injection,
+    _question_with_score_injection,
     _sse_done,
     _sse_event,
     _strip_leading_hallucinated_score_tail,
@@ -34,6 +36,9 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 _DISCONNECT_CANCEL_STATS_LOCK = threading.Lock()
 _DISCONNECT_CANCEL_TRIGGERED_TOTAL = 0
+_INVALID_IMAGE_REFUSAL_CN_RE = re.compile(r"(图像|图片).{0,8}(无效|不可见|无法识别|损坏)", re.IGNORECASE)
+_LOW_RES_HINT_RE = re.compile(r"(低分辨率|分辨率低|模糊|不清晰|像素化)", re.IGNORECASE)
+_TEXT_OVERLAY_HINT_RE = re.compile(r"(文字遮挡|文字覆盖|水印过多|文本过多)", re.IGNORECASE)
 
 
 class _DisconnectStoppingCriteria(StoppingCriteria):
@@ -56,6 +61,120 @@ def _record_disconnect_cancel_stat(*, grace_sec: float, disconnected_for_sec: fl
         disconnected_for_sec,
         request_elapsed_sec,
     )
+
+
+def _explainable_reason_code_from_text(reason_text: str) -> str:
+    if _LOW_RES_HINT_RE.search(reason_text):
+        return "low_resolution"
+    if _TEXT_OVERLAY_HINT_RE.search(reason_text):
+        return "text_overlay_heavy"
+    return "unclassified_image_quality_issue"
+
+
+def _normalize_score_branch_refusal(obj: Dict[str, Any], *, score_metrics: List[str]) -> Dict[str, Any]:
+    """
+    若服务端已完成图像评分，但模型仍输出“图像无效”拒答，则转为 insufficient_info，
+    并落地可解释原因码，避免与已观测图像事实冲突。
+    """
+    if not score_metrics:
+        return obj
+    if not isinstance(obj, dict):
+        return obj
+    if obj.get("task_type") != "refusal":
+        return obj
+    rr = obj.get("refusal_reason")
+    if not isinstance(rr, str) or not _INVALID_IMAGE_REFUSAL_CN_RE.search(rr):
+        return obj
+
+    reason_code = _explainable_reason_code_from_text(rr)
+    out = dict(obj)
+    out["schema_version"] = "1.1"
+    out["task_type"] = "insufficient_info"
+    out["refusal_reason"] = None
+    out["summary"] = "图像已被观测，但当前信息不足以完成有效分析。"
+
+    rb = out.get("reasoning_brief")
+    if not isinstance(rb, str) or not rb.strip():
+        out["reasoning_brief"] = "服务端评分链路可用，但原始拒答理由与已观测事实冲突，已降级为信息不足处理。"
+
+    limitations = out.get("limitations")
+    if not isinstance(limitations, str) or not limitations.strip():
+        limitations = "图像已被观测，但当前证据不足以支撑原拒答结论。"
+    if "reason_code=" not in limitations:
+        limitations = f"{limitations.rstrip()}（reason_code={reason_code}）"
+    out["limitations"] = limitations
+
+    meta = out.get("meta")
+    if not isinstance(meta, dict):
+        meta = {}
+    notes = meta.get("notes")
+    notes_text = notes if isinstance(notes, str) and notes.strip() else "无"
+    marker = f"normalized_refusal_reason={reason_code}"
+    if marker not in notes_text:
+        notes_text = f"{notes_text}；{marker}" if notes_text != "无" else marker
+    meta["notes"] = notes_text
+    meta["image_observed"] = True
+    out["meta"] = meta
+    return out
+
+
+# _debug 体积上限：在 config/runtime.yaml 的 logging.debug_response 中配置，
+# 服务启动时由 runtime_yaml 写入 DEBUG_RESPONSE_* 环境变量（仍可直接设环境变量覆盖 YAML）。
+def _b64_payload_decoded_byte_len(payload: str) -> int:
+    """计算标准 base64 解码后的字节数，不分配解码缓冲区。"""
+    p = "".join(payload.split())
+    if not p:
+        return 0
+    pad = 2 if p.endswith("==") else (1 if p.endswith("=") else 0)
+    return max(0, len(p) // 4 * 3 - pad)
+
+
+def _debug_data_url_summary(s: str) -> Optional[str]:
+    """
+    若为 data:...;base64,...，则仅返回 mime 与解码后字节数，不包含任何 base64 正文。
+    """
+    sep = ";base64,"
+    idx = s.find(sep)
+    if idx < 0:
+        return None
+    head = s[:idx]
+    if not head.lower().startswith("data:"):
+        return None
+    mime = head[5:] if head.startswith("data:") else "unknown"
+    payload = s[idx + len(sep) :]
+    n = _b64_payload_decoded_byte_len(payload)
+    tag = "debug_image" if mime.lower().startswith("image/") else "debug_data"
+    return f"[{tag} mime={mime} decoded_bytes={n}]"
+
+
+def _debug_redact_string(s: str) -> str:
+    """压缩/脱敏过长字符串；图片 data URL 仅保留 mime 与解码字节数。"""
+    if not s:
+        return s
+    max_plain = int(os.environ.get("DEBUG_RESPONSE_PLAIN_STRING_MAX", "8192"))
+    du = _debug_data_url_summary(s)
+    if du is not None:
+        return du
+    if len(s) > max_plain:
+        return s[:max_plain] + f"...<truncated total_len={len(s)}>"
+    return s
+
+
+def _debug_redact_value(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {str(k): _debug_redact_value(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_debug_redact_value(x) for x in obj]
+    if isinstance(obj, str):
+        return _debug_redact_string(obj)
+    return obj
+
+
+def _debug_model_output_text(raw: str) -> str:
+    cap = int(os.environ.get("DEBUG_RESPONSE_MODEL_OUTPUT_MAX_CHARS", "500000"))
+    if len(raw) > cap:
+        return raw[:cap] + f"...<truncated total_len={len(raw)}>"
+    return raw
 
 
 @router.post("/v1/chat/completions")
@@ -130,7 +249,7 @@ async def chat_completions(req: Request):
                 )
                 _maybe_cuda_reclaim(stage="after_score_before_chat")
             question_eff = (
-                _question_with_json_score_injection(question, score_block)
+                _question_with_score_injection(question, score_block)
                 if json_score_in_user and score_block
                 else question
             )
@@ -215,18 +334,35 @@ async def chat_completions(req: Request):
             return await infer_task
 
     raw_text = await run_infer()
-    text = _repair_assistant_json_corruption(raw_text)
+    if _debug_log_enabled() and logger.isEnabledFor(logging.DEBUG):
+        rt = raw_text.strip()
+        lines = rt.splitlines()
+        logger.debug(
+            "chat 路由 KV 解析入参（与 model.chat 解码输出一致）: len=%s line_count=%s starts_BEGIN=%s "
+            "starts_brace=%s first_line=%r preview=%r",
+            len(rt),
+            len(lines),
+            rt.startswith("BEGIN_UNIPERCEPT_KV"),
+            rt.startswith("{"),
+            (lines[0][:220] if lines else ""),
+            rt.replace("\n", "⏎")[:420],
+        )
+    out_obj = assistant_kv_text_to_obj(raw_text)
+    out_obj = _normalize_score_branch_refusal(out_obj, score_metrics=score_metrics)
+    if _debug_log_enabled():
+        dbg: Dict[str, Any] = {
+            "request": _debug_redact_value(dict(body)),
+            "model_output_text": _debug_model_output_text(raw_text),
+        }
+        out_obj = {**out_obj, "_debug": dbg}
+    text = json.dumps(out_obj, ensure_ascii=False)
     repaired_len = len(text.strip())
     if _debug_log_enabled() and logger.isEnabledFor(logging.DEBUG):
         logger.debug(
-            "输出收敛：raw_len=%s repaired_len=%s",
+            "输出收敛：raw_len=%s json_len=%s",
             len(raw_text.strip()),
             repaired_len,
         )
-    if not text.strip():
-        if _debug_log_enabled() and logger.isEnabledFor(logging.DEBUG):
-            logger.debug("输出收敛：repair 后为空，回退到 raw_text")
-        text = raw_text
     if _debug_log_enabled() and logger.isEnabledFor(logging.DEBUG):
         logger.debug(
             "请求完成（统一 SSE 返回）：stream=%s 耗时=%.3fs",

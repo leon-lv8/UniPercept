@@ -413,6 +413,15 @@ class InternVLChatModel(PreTrainedModel):
         if history is None and pixel_values is not None and '<image>' not in question:
             question = '<image>\n' + question
 
+        # 与 config/system_prompt_kv.txt 对齐：抑制模型惯性输出整段 JSON（仅追加用户侧提醒，不做 JSON 回退解析）。
+        _kv_output_reminder = (
+            "\n\n【输出格式硬性提醒】本条助手回复必须是行式 KV：首行恰好 BEGIN_UNIPERCEPT_KV，"
+            "末行恰好 END_UNIPERCEPT_KV，中间每行 英文键名: 值。"
+            "禁止 JSON：禁止以 `{` 开头、禁止整段 `{...}`、禁止 `\"schema_version\"` 形式。"
+            "除键名与 true/false/null 字面量外，所有描述类「值」须用简体中文（含主类九中文枚举、标签与描述）。"
+        )
+        question = question.rstrip() + _kv_output_reminder
+
         if num_patches_list is None:
             num_patches_list = [pixel_values.shape[0]] if pixel_values is not None else []
         assert pixel_values is None or len(pixel_values) == sum(num_patches_list)
@@ -454,10 +463,19 @@ class InternVLChatModel(PreTrainedModel):
 
         response = tokenizer.batch_decode(generation_output, skip_special_tokens=True)[0]
         response = response.split(template.sep.strip())[0].strip()
-        if _env_bool("CHAT_JSON_REPAIR", True) and response.lstrip().startswith("{"):
-            from internvl.json_assistant_repair import repair_assistant_json_corruption
-
-            response = repair_assistant_json_corruption(response)
+        if _debug_log_enabled() and logger.isEnabledFor(10):
+            lines = response.splitlines()
+            first_ln = lines[0] if lines else ""
+            logger.debug(
+                "模型 chat 解码后(原始助手文本，由路由层 assistant_kv 转 JSON): len=%s line_count=%s "
+                "first_line=%r starts_BEGIN=%s starts_brace=%s head_one_line=%r",
+                len(response),
+                len(lines),
+                first_ln[:200],
+                response.lstrip().startswith("BEGIN_UNIPERCEPT_KV"),
+                response.lstrip().startswith("{"),
+                first_ln.replace("\n", "\\n")[:500] if len(first_ln) <= 500 else (first_ln[:500] + "..."),
+            )
         history.append((question, response))
         if _debug_log_enabled() and logger.isEnabledFor(10):
             logger.debug("模型 chat 完成：response_chars=%s", len(response))

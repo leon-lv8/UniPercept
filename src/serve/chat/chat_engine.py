@@ -177,14 +177,18 @@ def _compute_score_block(
 def _score_block_for_user_prompt(score_block: str) -> str:
     body = score_block.rstrip()
     return (
-        "【以下为服务端已确定的 IAA/IQA/ISTA 评分，请在输出 JSON 的 aesthetic.scores 中"
-        "使用 iaa/iqa/ista 三个数字字段填入与下列完全一致的数值（保留一位或两位小数均可，"
-        "但必须与下列分数一致）；不得改写或另造分数。】\n"
+        "【以下为服务端已确定的 IAA/IQA/ISTA 评分，请在 BEGIN/END 块内使用扁平键 "
+        "aesthetic.scores.iaa、aesthetic.scores.iqa、aesthetic.scores.ista 填入与下列完全一致的数值"
+        "（保留一位或两位小数均可，但必须与下列分数一致）；不得改写或另造分数。】\n"
+        "【一致性硬约束】既然已有上述评分，表示图像已被成功观测："
+        "meta.image_observed 必须为 true；"
+        "禁止输出 task_type=refusal 且 refusal_reason 为“图像无效/图像不可见/无效图片”等同义理由。"
+        "若信息不足，请使用 task_type=insufficient_info 并明确 limitations。\n"
         f"{body}"
     )
 
 
-def _question_with_json_score_injection(question: str, score_block: str) -> str:
+def _question_with_score_injection(question: str, score_block: str) -> str:
     suffix = _score_block_for_user_prompt(score_block)
     if not question.strip():
         return suffix

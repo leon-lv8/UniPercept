@@ -58,6 +58,12 @@ def _mapping_pairs(data: Mapping[str, Any]) -> List[Tuple[str, str]]:
     logging_cfg = section("logging")
     if "enable_debug" in logging_cfg:
         out.append(("ENABLE_DEBUG_LOG", _as_env_str(logging_cfg["enable_debug"])))
+    dr = logging_cfg.get("debug_response")
+    if isinstance(dr, Mapping):
+        if "plain_string_max" in dr:
+            out.append(("DEBUG_RESPONSE_PLAIN_STRING_MAX", _as_env_str(dr["plain_string_max"])))
+        if "model_output_max_chars" in dr:
+            out.append(("DEBUG_RESPONSE_MODEL_OUTPUT_MAX_CHARS", _as_env_str(dr["model_output_max_chars"])))
 
     weights = section("weights")
     if "load_order" in weights:
