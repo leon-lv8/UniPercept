@@ -29,6 +29,8 @@
 #   weights.vision.bnb_4bit.double_quant -> VISION_BNB_4BIT_DOUBLE_QUANT
 #   weights.vision.bnb_4bit.compute_fp16 -> VISION_BNB_4BIT_COMPUTE_FP16
 #   weights.cuda.force_reclaim_between_towers -> FORCE_RECLAIM_BETWEEN_TOWERS
+#   weights.cuda.pytorch_cuda_alloc_conf -> PYTORCH_CUDA_ALLOC_CONF（非空才写入；依赖 PyTorch/CUDA 版本）
+#   weights.cuda.cuda_managed_force_device_alloc -> CUDA_MANAGED_FORCE_DEVICE_ALLOC（非空才写入）
 #   weights.bnb_modules_to_not_convert -> BNB_MODULES_TO_NOT_CONVERT（逗号分隔，可选）
 #   inference.use_cache               -> INFERENCE_USE_CACHE
 #   inference.disconnect_cancel_grace_sec -> DISCONNECT_CANCEL_GRACE_SEC
@@ -115,7 +117,7 @@ weights:
   # - 勿写未加引号的 off/on/yes/no：YAML 1.1 会解析成布尔值；服务端已对 False 做兼容，但推荐写成引号字符串。
   llm:
     # 语言塔量化模式。
-    quant_mode: "off" # "none" | "8bit" | "4bit"
+    quant_mode: "4bit" # "none" | "8bit" | "4bit"
     # bnb_4bit：仅当 quant_mode=4bit 时使用（bitsandbytes 4-bit 加载参数）。
     bnb_4bit:
       # quant_type：4-bit 量化格式。
@@ -128,7 +130,7 @@ weights:
       # 一般情况下：true 更省显存/更快；若遇到数值不稳定或不支持，可尝试关闭并结合硬件能力调整。
       compute_fp16: true
   vision:
-    quant_mode: "off" # "none" | "8bit" | "4bit"
+    quant_mode: "4bit" # "none" | "8bit" | "4bit"
     # bnb_4bit：仅当 quant_mode=4bit 时使用（与 llm.bnb_4bit 含义一致，但可独立设置）。
     bnb_4bit:
       quant_type: nf4
@@ -142,6 +144,12 @@ weights:
     #   用于压低峰值/碎片导致的 reserved；关闭时仍遵循 INFERENCE_RECLAIM_BETWEEN_STAGES 的轻量 reclaim。
     #   仅由本项（或同名环境变量）控制，与 logging.enable_debug / ENABLE_DEBUG_LOG 无关。
     force_reclaim_between_towers: true
+    # pytorch_cuda_alloc_conf -> PYTORCH_CUDA_ALLOC_CONF：PyTorch CUDA 缓存分配器配置串（见官方文档）。
+    #   典型值 expandable_segments:True 可缓解部分碎片化场景；不需要时删除本键或设为 null。
+    pytorch_cuda_alloc_conf: "expandable_segments:True"
+    # cuda_managed_force_device_alloc -> CUDA_MANAGED_FORCE_DEVICE_ALLOC：托管内存/设备侧分配相关开关（字符串，常见为 "1"）。
+    #   不需要时删除本键或设为 null。
+    cuda_managed_force_device_alloc: "1"
 
   # bnb_modules_to_not_convert -> BNB_MODULES_TO_NOT_CONVERT
   # 逗号分隔的额外跳过前缀；会分别合并到 llm/vision 加载阶段的默认跳过集合。

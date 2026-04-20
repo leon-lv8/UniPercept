@@ -120,6 +120,19 @@ def _mapping_pairs(data: Mapping[str, Any]) -> List[Tuple[str, str]]:
     if isinstance(cuda_w, Mapping):
         if "force_reclaim_between_towers" in cuda_w:
             out.append(("FORCE_RECLAIM_BETWEEN_TOWERS", _as_env_str(cuda_w["force_reclaim_between_towers"])))
+        # Optional PyTorch/CUDA allocator tuning (non-empty string only; omit or null to skip).
+        if "pytorch_cuda_alloc_conf" in cuda_w:
+            pconf = cuda_w["pytorch_cuda_alloc_conf"]
+            if pconf is not None:
+                pconf_s = _as_env_str(pconf).strip()
+                if pconf_s:
+                    out.append(("PYTORCH_CUDA_ALLOC_CONF", pconf_s))
+        if "cuda_managed_force_device_alloc" in cuda_w:
+            mdev = cuda_w["cuda_managed_force_device_alloc"]
+            if mdev is not None:
+                mdev_s = _as_env_str(mdev).strip()
+                if mdev_s:
+                    out.append(("CUDA_MANAGED_FORCE_DEVICE_ALLOC", mdev_s))
     if "bnb_modules_to_not_convert" in weights:
         bnb_skip = weights["bnb_modules_to_not_convert"]
         if isinstance(bnb_skip, (list, tuple)):

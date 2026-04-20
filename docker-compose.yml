@@ -52,7 +52,7 @@ services:
       context: .
       dockerfile: docker/Dockerfile
       args:
-        INSTALL_FLASH_ATTN: "false"
+        INSTALL_FLASH_ATTN: "true"
         INSTALL_GIT: "${INSTALL_GIT:-false}"
         INSTALL_BITSANDBYTES: "${INSTALL_BITSANDBYTES:-true}"
     image: unipercept-openai:latest

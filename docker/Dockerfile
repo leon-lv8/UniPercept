@@ -1,8 +1,10 @@
 ARG BASE_IMAGE=pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
+# Builder uses devel so `pip wheel flash_attn` can compile when no matching prebuilt wheel exists; runtime stays slim (BASE_IMAGE).
+ARG BASE_IMAGE_BUILDER=pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel
 ARG INSTALL_GIT=true
 ARG INSTALL_BITSANDBYTES=true
 
-FROM ${BASE_IMAGE} AS builder
+FROM ${BASE_IMAGE_BUILDER} AS builder
 
 WORKDIR /workspace
 
@@ -40,6 +42,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 ARG INSTALL_GIT
 ARG INSTALL_BITSANDBYTES
+ARG INSTALL_FLASH_ATTN=false
 
 # System deps (minimal). git is sometimes needed by HF for some repos; keep it lightweight.
 RUN if [ "${INSTALL_GIT}" = "true" ]; then \
@@ -59,6 +62,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
       -r /workspace/docker/requirements.server.txt && \
     if [ "${INSTALL_BITSANDBYTES}" = "true" ]; then \
       python -m pip install --no-index --find-links=/wheels "bitsandbytes==0.47.0"; \
+    fi && \
+    if [ "${INSTALL_FLASH_ATTN}" = "true" ]; then \
+      python -m pip install --no-index --find-links=/wheels "flash_attn>=2.8.3"; \
     fi && \
     rm -rf /wheels
 
