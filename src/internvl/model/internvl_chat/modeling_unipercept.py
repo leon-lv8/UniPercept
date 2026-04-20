@@ -398,6 +398,7 @@ class InternVLChatModel(PreTrainedModel):
              history=None,
              return_history=False,
              num_patches_list=None,
+             visual_features=None,
              IMG_START_TOKEN='<img>',
              IMG_END_TOKEN='</img>',
              IMG_CONTEXT_TOKEN='<IMG_CONTEXT>',
@@ -456,10 +457,13 @@ class InternVLChatModel(PreTrainedModel):
         attention_mask = model_inputs['attention_mask'].to(device)
         generation_config['eos_token_id'] = eos_token_id
 
-        generation_output = self.generate(pixel_values=pixel_values,
-                                          input_ids=input_ids,
-                                          attention_mask=attention_mask,
-                                          **generation_config)
+        generation_output = self.generate(
+            pixel_values=pixel_values,
+            visual_features=visual_features,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            **generation_config,
+        )
 
         response = tokenizer.batch_decode(generation_output, skip_special_tokens=True)[0]
         response = response.split(template.sep.strip())[0].strip()

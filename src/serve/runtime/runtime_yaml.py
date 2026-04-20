@@ -14,6 +14,23 @@ def _as_env_str(value: Any) -> str:
     return str(value)
 
 
+def _quant_mode_yaml_to_env_str(value: Any, *, path: str) -> str:
+    """Map weights.*.quant_mode to WEIGHT_QUANT_MODE_* string env.
+
+    PyYAML parses unquoted YAML-1.1 scalars ``off`` / ``no`` as bool False; those
+    must mean quantization off (``none``), not the literal string ``false``.
+    """
+    if isinstance(value, bool):
+        if value:
+            raise RuntimeError(
+                "%s: quant_mode must be a string (none, off, 8bit, 4bit); "
+                "boolean true is not supported (avoid unquoted yes/on/true in YAML)."
+                % path
+            )
+        return "none"
+    return _as_env_str(value)
+
+
 def _resolve_runtime_config_path() -> Optional[Path]:
     """Resolve YAML path: if RUNTIME_CONFIG_FILE is set, only that path; else try defaults."""
     explicit = os.environ.get("RUNTIME_CONFIG_FILE", "").strip()
@@ -50,6 +67,8 @@ def _mapping_pairs(data: Mapping[str, Any]) -> List[Tuple[str, str]]:
         out.append(("PORT", _as_env_str(serve["port"])))
     if "prefer_cuda" in serve:
         out.append(("PREFER_CUDA", _as_env_str(serve["prefer_cuda"])))
+    if "skip_model_warmup" in serve:
+        out.append(("SKIP_MODEL_WARMUP", _as_env_str(serve["skip_model_warmup"])))
 
     prompt = section("prompt")
     if "system_prompt_file" in prompt:
@@ -70,7 +89,9 @@ def _mapping_pairs(data: Mapping[str, Any]) -> List[Tuple[str, str]]:
         out.append(("WEIGHT_TOWER_LOAD_ORDER", _as_env_str(weights["load_order"])))
     llm = weights.get("llm")
     if isinstance(llm, Mapping) and "quant_mode" in llm:
-        out.append(("WEIGHT_QUANT_MODE_LLM", _as_env_str(llm["quant_mode"])))
+        out.append(
+            ("WEIGHT_QUANT_MODE_LLM", _quant_mode_yaml_to_env_str(llm["quant_mode"], path="weights.llm.quant_mode"))
+        )
     llm_bnb = llm.get("bnb_4bit") if isinstance(llm, Mapping) else None
     if isinstance(llm_bnb, Mapping):
         if "quant_type" in llm_bnb:
@@ -81,7 +102,12 @@ def _mapping_pairs(data: Mapping[str, Any]) -> List[Tuple[str, str]]:
             out.append(("LLM_BNB_4BIT_COMPUTE_FP16", _as_env_str(llm_bnb["compute_fp16"])))
     vision_q = weights.get("vision")
     if isinstance(vision_q, Mapping) and "quant_mode" in vision_q:
-        out.append(("WEIGHT_QUANT_MODE_VISION", _as_env_str(vision_q["quant_mode"])))
+        out.append(
+            (
+                "WEIGHT_QUANT_MODE_VISION",
+                _quant_mode_yaml_to_env_str(vision_q["quant_mode"], path="weights.vision.quant_mode"),
+            )
+        )
     vision_bnb = vision_q.get("bnb_4bit") if isinstance(vision_q, Mapping) else None
     if isinstance(vision_bnb, Mapping):
         if "quant_type" in vision_bnb:

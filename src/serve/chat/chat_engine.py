@@ -138,7 +138,7 @@ def _compute_score_block(
     pixel_values: torch.Tensor,
     generation_config: Dict[str, Any],
     metrics: List[str],
-) -> Tuple[str, Dict[str, float]]:
+) -> Tuple[str, Dict[str, float], Optional[torch.Tensor]]:
     if STATE.model is None or STATE.tokenizer is None or STATE.device is None:
         raise RuntimeError("Model is not loaded")
     values: Dict[str, float] = {}
@@ -167,11 +167,11 @@ def _compute_score_block(
             out_lines.append(f"{label}: （计算失败）")
         finally:
             _maybe_cuda_reclaim(stage=f"score_{metric}")
-    del visual_features
     _maybe_cuda_reclaim(stage="score_all_done")
     if _debug_log_enabled() and logger.isEnabledFor(logging.DEBUG):
         logger.debug("评分分块计算完成，成功项=%s", len(values))
-    return "\n".join(out_lines) + "\n", values
+    # 保留 visual_features 供随后 model.chat(..., visual_features=...) 复用，避免二次 extract_feature 顶高显存峰值。
+    return "\n".join(out_lines) + "\n", values, visual_features
 
 
 def _score_block_for_user_prompt(score_block: str) -> str:

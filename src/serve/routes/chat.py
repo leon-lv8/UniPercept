@@ -26,7 +26,13 @@ from ..chat.chat_engine import (
     _sse_event,
     _strip_leading_hallucinated_score_tail,
 )
-from ..runtime.env_utils import _debug_log_enabled, _maybe_cuda_reclaim, _now_ts
+from ..runtime.env_utils import (
+    _cuda_reclaim_after_oom,
+    _debug_log_enabled,
+    _is_cuda_oom_error,
+    _maybe_cuda_reclaim,
+    _now_ts,
+)
 from ..chat.openai_messages import _messages_to_chat_inputs
 from ..openai_types import ChatCompletionRequest
 from ..runtime.state import STATE, _raise_if_model_unavailable
@@ -248,9 +254,10 @@ async def chat_completions(req: Request):
             pixel_values = _pixels_to_device(pixel_values_cpu)
             chunks: List[str] = []
             score_block = ""
+            vf_for_chat: Optional[torch.Tensor] = None
             if score_metrics:
                 assert pixel_values is not None
-                score_block, _ = _compute_score_block(
+                score_block, _, vf_for_chat = _compute_score_block(
                     pixel_values, generation_config, score_metrics
                 )
                 _maybe_cuda_reclaim(stage="after_score_before_chat")
@@ -279,15 +286,20 @@ async def chat_completions(req: Request):
                 if STATE.device.type == "cuda":
                     torch.cuda.synchronize(STATE.device)
                 return out.strip()
-            out = STATE.model.chat(
-                str(STATE.device),
-                STATE.tokenizer,
-                pixel_values,
-                question_eff,
-                chat_generation_config,
-                history=history or None,
-                return_history=False,
-            )
+            try:
+                out = STATE.model.chat(
+                    str(STATE.device),
+                    STATE.tokenizer,
+                    pixel_values,
+                    question_eff,
+                    chat_generation_config,
+                    history=history or None,
+                    return_history=False,
+                    visual_features=vf_for_chat,
+                )
+            finally:
+                if vf_for_chat is not None:
+                    del vf_for_chat
             out_stripped = out.strip()
             cleaned_out = _strip_leading_hallucinated_score_tail(out_stripped).strip()
             if _debug_log_enabled() and logger.isEnabledFor(logging.DEBUG):
@@ -340,7 +352,15 @@ async def chat_completions(req: Request):
                         disconnect_stop_logged = True
                 else:
                     disconnected_since = None
-            return await infer_task
+            try:
+                return await infer_task
+            except BaseException as exc:
+                if _is_cuda_oom_error(exc):
+                    try:
+                        await asyncio.to_thread(_cuda_reclaim_after_oom, "chat_completions")
+                    except Exception:
+                        logger.exception("OOM 后显存回收失败（已忽略）")
+                raise
 
     raw_text = await run_infer()
     sanitized_text = sanitize_model_text(raw_text)

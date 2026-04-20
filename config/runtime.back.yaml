@@ -15,7 +15,6 @@
 #   serve.model_id                    -> MODEL_ID
 #   serve.port                        -> PORT
 #   serve.prefer_cuda                 -> PREFER_CUDA
-#   serve.skip_model_warmup           -> SKIP_MODEL_WARMUP
 #   prompt.system_prompt_file         -> SYSTEM_PROMPT_FILE
 #   logging.enable_debug              -> ENABLE_DEBUG_LOG
 #   logging.debug_response.plain_string_max -> DEBUG_RESPONSE_PLAIN_STRING_MAX
@@ -42,7 +41,7 @@
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# serve — HTTP 服务与设备选择（映射 MODEL_ID / PORT / PREFER_CUDA / SKIP_MODEL_WARMUP）
+# serve — HTTP 服务与设备选择（映射 MODEL_ID / PORT / PREFER_CUDA）
 # -----------------------------------------------------------------------------
 serve:
   # model_id -> MODEL_ID：OpenAI 兼容接口对外返回、以及请求体里 model 字段可匹配的模型标识。
@@ -53,9 +52,6 @@ serve:
 
   # prefer_cuda -> PREFER_CUDA：是否在可用时优先使用 CUDA；false 时尝试 CPU（速度/显存需自行评估）。
   prefer_cuda: true
-
-  # skip_model_warmup -> SKIP_MODEL_WARMUP：true 时跳过启动后的「你好」预热，加快就绪；首请求可能更慢。
-  skip_model_warmup: true
 
 # -----------------------------------------------------------------------------
 # prompt — 系统提示词（映射 SYSTEM_PROMPT_FILE）
@@ -112,10 +108,9 @@ weights:
   # 注意：
   # - 量化主要影响「权重加载与推理显存/速度」，并不会改变接口协议；修改后需重启服务生效。
   # - 4bit/8bit 依赖 bitsandbytes 与对应 CUDA 环境；在不支持的环境下可能会回退或直接报错（以日志为准）。
-  # - 勿写未加引号的 off/on/yes/no：YAML 1.1 会解析成布尔值；服务端已对 False 做兼容，但推荐写成引号字符串。
   llm:
     # 语言塔量化模式。
-    quant_mode: "off" # "none" | "8bit" | "4bit"
+    quant_mode: 4bit # 8bit
     # bnb_4bit：仅当 quant_mode=4bit 时使用（bitsandbytes 4-bit 加载参数）。
     bnb_4bit:
       # quant_type：4-bit 量化格式。
@@ -128,7 +123,7 @@ weights:
       # 一般情况下：true 更省显存/更快；若遇到数值不稳定或不支持，可尝试关闭并结合硬件能力调整。
       compute_fp16: true
   vision:
-    quant_mode: "off" # "none" | "8bit" | "4bit"
+    quant_mode: 8bit # 8bit
     # bnb_4bit：仅当 quant_mode=4bit 时使用（与 llm.bnb_4bit 含义一致，但可独立设置）。
     bnb_4bit:
       quant_type: nf4

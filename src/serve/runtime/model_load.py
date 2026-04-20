@@ -337,7 +337,8 @@ def _load_model_once(
     stage_t0 = time.time()
     model = InternVLChatModel.from_pretrained(
         model_path,
-        trust_remote_code=False,
+        # trust_remote_code=False,
+        trust_remote_code=True,
         **model_kwargs,
     )
     if _debug_enabled():
@@ -670,28 +671,31 @@ def _load_model_worker(app: FastAPI) -> None:
         _validate_vision_env_against_config(model)
         _log_model_inference_profile(model, STATE.device, gen_cfg)  # type: ignore[arg-type]
 
-        try:
-            warmup_t0 = time.time()
-            if _debug_enabled():
-                logger.debug("【加载进度 4/4】开始执行模型预热请求。")
-            with torch.no_grad():
-                _ = model.chat(
-                    str(STATE.device),
-                    tokenizer,
-                    None,
-                    "你好",
-                    gen_cfg,
-                    history=None,
-                    return_history=False,
-                )
-            if STATE.device.type == "cuda":  # type: ignore[union-attr]
-                torch.cuda.synchronize(STATE.device)
-        except Exception:
-            if _debug_enabled():
-                logger.exception("模型预热失败，继续服务启动流程")
+        if _env_bool("SKIP_MODEL_WARMUP", False):
+            logger.info("已跳过模型预热（SKIP_MODEL_WARMUP=true）；首请求可能更慢或更易暴露惰性初始化问题。")
         else:
-            if _debug_enabled():
-                logger.debug("【加载进度 4/4】模型预热完成，耗时=%.3fs", time.time() - warmup_t0)
+            try:
+                warmup_t0 = time.time()
+                if _debug_enabled():
+                    logger.debug("【加载进度 4/4】开始执行模型预热请求。")
+                with torch.no_grad():
+                    _ = model.chat(
+                        str(STATE.device),
+                        tokenizer,
+                        None,
+                        "你好",
+                        gen_cfg,
+                        history=None,
+                        return_history=False,
+                    )
+                if STATE.device.type == "cuda":  # type: ignore[union-attr]
+                    torch.cuda.synchronize(STATE.device)
+            except Exception:
+                if _debug_enabled():
+                    logger.exception("模型预热失败，继续服务启动流程")
+            else:
+                if _debug_enabled():
+                    logger.debug("【加载进度 4/4】模型预热完成，耗时=%.3fs", time.time() - warmup_t0)
 
         STATE.tokenizer = tokenizer
         STATE.gen_cfg = gen_cfg

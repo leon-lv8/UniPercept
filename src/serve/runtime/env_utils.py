@@ -117,6 +117,44 @@ def _cuda_reclaim(stage: str = "", *, force: bool = False) -> Tuple[Dict[str, An
     return before, after
 
 
+def _is_cuda_oom_error(exc: BaseException) -> bool:
+    """True when the failure is a CUDA / GPU out-of-memory (English messages included)."""
+    torch = _get_torch()
+    oom_cls = getattr(torch, "OutOfMemoryError", None)
+    if oom_cls is not None and isinstance(exc, oom_cls):
+        return True
+    if isinstance(exc, MemoryError):
+        return True
+    if isinstance(exc, RuntimeError):
+        msg = str(exc).lower()
+        if "out of memory" in msg and ("cuda" in msg or "gpu" in msg):
+            return True
+    return False
+
+
+def _cuda_reclaim_after_oom(stage: str = "cuda_oom") -> None:
+    """Aggressive reclaim after CUDA OOM so the next request is less likely to fail on fragmentation."""
+    logger.warning("CUDA OOM 后执行显存回收：stage=%s", stage)
+    try:
+        before, after = _cuda_reclaim(stage=stage, force=True)
+        if _debug_log_enabled() and logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "OOM reclaim：前=%s 后=%s",
+                _format_cuda_mem(before),
+                _format_cuda_mem(after),
+            )
+    except Exception:
+        logger.exception("OOM 后显存回收失败（已忽略）")
+        return
+    if STATE.device is None or STATE.device.type != "cuda":
+        return
+    try:
+        torch = _get_torch()
+        torch.cuda.synchronize(STATE.device)
+    except Exception:
+        pass
+
+
 def _configure_debug_logging_from_env() -> None:
     """Enable DEBUG level for project loggers when ENABLE_DEBUG_LOG=true."""
     if not _debug_log_enabled():
@@ -249,6 +287,9 @@ def _normalize_quant_mode(raw: Optional[str], *, env_name: str) -> Optional[str]
     mode = raw.strip().lower()
     if not mode:
         return None
+    # Docker / YAML bool false often surfaces as the string "false"; treat as off.
+    if mode in ("false", "no", "0"):
+        return "none"
     if mode in ("none", "off"):
         return "none"
     if mode in ("8bit", "8-bit"):
