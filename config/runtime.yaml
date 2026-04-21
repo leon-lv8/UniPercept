@@ -57,7 +57,7 @@ serve:
   prefer_cuda: true
 
   # skip_model_warmup -> SKIP_MODEL_WARMUP：true 时跳过启动后的「你好」预热，加快就绪；首请求可能更慢。
-  skip_model_warmup: true
+  skip_model_warmup: false
 
 # -----------------------------------------------------------------------------
 # prompt — 系统提示词（映射 SYSTEM_PROMPT_FILE）

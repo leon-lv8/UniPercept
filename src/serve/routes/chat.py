@@ -21,7 +21,6 @@ from ..chat.chat_engine import (
     _auto_score_metrics,
     _compute_score_block,
     _merge_request_generation_config,
-    _question_with_score_injection,
     _sse_done,
     _sse_event,
     _strip_leading_hallucinated_score_tail,
@@ -121,6 +120,36 @@ def _normalize_score_branch_refusal(obj: Dict[str, Any], *, score_metrics: List[
     meta["notes"] = notes_text
     meta["image_observed"] = True
     out["meta"] = meta
+    return out
+
+
+def _merge_server_aesthetic_scores(obj: Dict[str, Any], server_scores: Dict[str, float]) -> Dict[str, Any]:
+    """
+    将本请求内 model.score 得到的 IAA/IQA/ISTA 合并进解析后的对象：
+    - 仅当 server_scores 非空（至少一项算分成功）时，将 meta.image_observed 置为 true；
+    - 仅当 task_type 为 aesthetic_analysis 且 aesthetic 为对象时，用 server_scores 中的键覆盖 aesthetic.scores 对应项。
+    """
+    if not server_scores or not isinstance(obj, dict):
+        return obj
+    out = dict(obj)
+    meta = out.get("meta")
+    if isinstance(meta, dict):
+        out["meta"] = {**meta, "image_observed": True}
+    if out.get("task_type") != "aesthetic_analysis":
+        return out
+    ae = out.get("aesthetic")
+    if not isinstance(ae, dict):
+        return out
+    sc = ae.get("scores")
+    new_sc: Dict[str, Any] = {"iaa": None, "iqa": None, "ista": None}
+    if isinstance(sc, dict):
+        for k in new_sc:
+            if k in sc:
+                new_sc[k] = sc[k]
+    for k, v in server_scores.items():
+        if k in new_sc:
+            new_sc[k] = float(v)
+    out["aesthetic"] = {**ae, "scores": new_sc}
     return out
 
 
@@ -228,12 +257,12 @@ async def chat_completions(req: Request):
         generation_config["max_new_tokens"] = parsed_max_tokens
 
     score_metrics = _auto_score_metrics(pixel_values_cpu)
-    json_score_in_user = bool(score_metrics)
+    auto_score_branch = bool(score_metrics)
     if _debug_log_enabled() and logger.isEnabledFor(logging.DEBUG):
         logger.debug(
-            "请求分支：score_metrics=%s json_score_in_user=%s",
+            "请求分支：score_metrics=%s auto_score_branch=%s",
             bool(score_metrics),
-            json_score_in_user,
+            auto_score_branch,
         )
 
     def _pixels_to_device(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -242,33 +271,32 @@ async def chat_completions(req: Request):
         return t.to(STATE.device, dtype=_pixel_dtype(STATE.device))  # type: ignore[arg-type]
 
     disconnect_grace_sec = float(os.environ.get("DISCONNECT_CANCEL_GRACE_SEC", "3"))
+    server_aesthetic_scores: Dict[str, float] = {}
     prompt_debug: Dict[str, Any] = {
         "question_user_raw": question,
         "question_for_model": question,
-        "score_block": "",
-        "score_injection_applied": False,
+        "server_aesthetic_scores": {},
+        "auto_score_computed": False,
     }
 
     def _run_infer_sync(stop_event: threading.Event) -> str:
         with torch.no_grad():
             pixel_values = _pixels_to_device(pixel_values_cpu)
             chunks: List[str] = []
-            score_block = ""
             vf_for_chat: Optional[torch.Tensor] = None
             if score_metrics:
                 assert pixel_values is not None
-                score_block, _, vf_for_chat = _compute_score_block(
+                vals, vf_for_chat = _compute_score_block(
                     pixel_values, generation_config, score_metrics
                 )
+                server_aesthetic_scores.clear()
+                server_aesthetic_scores.update(vals)
                 _maybe_cuda_reclaim(stage="after_score_before_chat")
-            question_eff = (
-                _question_with_score_injection(question, score_block)
-                if json_score_in_user and score_block
-                else question
-            )
+            # 自动评分结果仅服务端合并进 JSON，不向用户消息追加分项或提示；与无评分分支相同传入 question。
+            question_eff = question
             prompt_debug["question_for_model"] = question_eff
-            prompt_debug["score_block"] = score_block
-            prompt_debug["score_injection_applied"] = bool(json_score_in_user and score_block)
+            prompt_debug["server_aesthetic_scores"] = dict(server_aesthetic_scores)
+            prompt_debug["auto_score_computed"] = bool(score_metrics)
             chat_generation_config = dict(generation_config)
             chat_generation_config["stopping_criteria"] = StoppingCriteriaList(
                 [_DisconnectStoppingCriteria(stop_event)]
@@ -379,6 +407,7 @@ async def chat_completions(req: Request):
         )
     out_obj = assistant_kv_text_to_obj(sanitized_text)
     out_obj = _normalize_score_branch_refusal(out_obj, score_metrics=score_metrics)
+    out_obj = _merge_server_aesthetic_scores(out_obj, server_aesthetic_scores)
     if _debug_log_enabled():
         sys_prompt = str(getattr(STATE.model, "system_message", "") or "")
         dbg: Dict[str, Any] = {
@@ -387,8 +416,8 @@ async def chat_completions(req: Request):
             "prompt_to_model": {
                 "question_user_raw": _debug_redact_string(str(prompt_debug.get("question_user_raw", ""))),
                 "question_for_model": _debug_redact_string(str(prompt_debug.get("question_for_model", ""))),
-                "score_block": _debug_redact_string(str(prompt_debug.get("score_block", ""))),
-                "score_injection_applied": bool(prompt_debug.get("score_injection_applied")),
+                "server_aesthetic_scores": _debug_redact_value(dict(prompt_debug.get("server_aesthetic_scores") or {})),
+                "auto_score_computed": bool(prompt_debug.get("auto_score_computed")),
             },
             "model_output_text": _debug_model_output_text(sanitized_text),
         }

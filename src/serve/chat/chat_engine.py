@@ -138,13 +138,16 @@ def _compute_score_block(
     pixel_values: torch.Tensor,
     generation_config: Dict[str, Any],
     metrics: List[str],
-) -> Tuple[str, Dict[str, float], Optional[torch.Tensor]]:
+) -> Tuple[Dict[str, float], Optional[torch.Tensor]]:
+    """
+    对图像调用 model.score 得到 IAA/IQA/ISTA 等分项浮点值；结果仅用于服务端在解析 KV 后合并进 JSON，
+    不拼进用户消息。返回 (成功写入的 metric->分数, visual_features)；失败项不出现在 dict 中。
+    """
     if STATE.model is None or STATE.tokenizer is None or STATE.device is None:
         raise RuntimeError("Model is not loaded")
     values: Dict[str, float] = {}
-    out_lines: List[str] = []
     if _debug_log_enabled() and logger.isEnabledFor(logging.DEBUG):
-        logger.debug("开始计算评分分块，metrics=%s", ",".join(metrics))
+        logger.debug("开始计算自动评分（仅服务端合并），metrics=%s", ",".join(metrics))
     with torch.no_grad():
         visual_features = STATE.model.extract_feature(pixel_values)
     for metric in metrics:
@@ -161,40 +164,22 @@ def _compute_score_block(
             )
             fv = float(s)
             values[metric] = fv
-            out_lines.append(f"{label}: {fv:.2f}/100")
         except Exception:
-            logger.exception("model.score failed for metric=%s", metric)
-            out_lines.append(f"{label}: （计算失败）")
+            logger.exception("model.score failed for metric=%s (%s)", metric, label)
         finally:
             _maybe_cuda_reclaim(stage=f"score_{metric}")
     _maybe_cuda_reclaim(stage="score_all_done")
     if _debug_log_enabled() and logger.isEnabledFor(logging.DEBUG):
-        logger.debug("评分分块计算完成，成功项=%s", len(values))
+        scores_detail = ", ".join(
+            f"{m}={values[m]:.2f}" for m in metrics if m in values
+        )
+        logger.debug(
+            "自动评分计算完成（服务端合并），成功项=%s，分数=%s",
+            len(values),
+            scores_detail or "（无）",
+        )
     # 保留 visual_features 供随后 model.chat(..., visual_features=...) 复用，避免二次 extract_feature 顶高显存峰值。
-    return "\n".join(out_lines) + "\n", values, visual_features
-
-
-def _score_block_for_user_prompt(score_block: str) -> str:
-    body = score_block.rstrip()
-    return (
-        "【以下为服务端已确定的 IAA/IQA/ISTA 评分，请在 BEGIN/END 块内使用扁平键 "
-        "aesthetic.scores.iaa、aesthetic.scores.iqa、aesthetic.scores.ista 填入与下列完全一致的数值"
-        "（保留一位或两位小数均可，但必须与下列分数一致）；不得改写或另造分数。】\n"
-        "【键名与格式硬约束】评分键名必须逐字正确（禁止 iaaa/iqaa 等变体），"
-        "数组字段必须使用 | 分隔，BEGIN/END 标记必须精确拼写。\n"
-        "【一致性硬约束】既然已有上述评分，表示图像已被成功观测："
-        "meta.image_observed 必须为 true；"
-        "禁止输出 task_type=refusal 且 refusal_reason 为“图像无效/图像不可见/无效图片”等同义理由。"
-        "若信息不足，请使用 task_type=insufficient_info 并明确 limitations。\n"
-        f"{body}"
-    )
-
-
-def _question_with_score_injection(question: str, score_block: str) -> str:
-    suffix = _score_block_for_user_prompt(score_block)
-    if not question.strip():
-        return suffix
-    return f"{question.rstrip()}\n\n{suffix}"
+    return values, visual_features
 
 
 def _merge_request_generation_config(body: ChatCompletionRequest) -> Dict[str, Any]:
