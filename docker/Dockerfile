@@ -22,13 +22,19 @@ COPY docker/requirements.server.txt /workspace/docker/requirements.server.txt
 
 # Build wheels in a dedicated stage so runtime image stays slim.
 # BuildKit cache mount makes repeated builds much faster.
+# flash_attn: use PIP_CACHE_DIR/TMPDIR under /wheels for that step only — pip's cache mount is a different filesystem and its prebuilt-wheel path triggers EXDEV on rename.
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install -U pip wheel && \
     mkdir -p /wheels && \
     python -m pip wheel -w /wheels -r /workspace/docker/requirements.runtime.txt && \
     python -m pip wheel -w /wheels -r /workspace/docker/requirements.server.txt && \
     if [ "${INSTALL_BITSANDBYTES}" = "true" ]; then python -m pip wheel -w /wheels "bitsandbytes==0.47.0"; fi && \
-    if [ "${INSTALL_FLASH_ATTN}" = "true" ]; then python -m pip wheel -w /wheels "flash_attn>=2.8.3"; fi
+    if [ "${INSTALL_FLASH_ATTN}" = "true" ]; then \
+      mkdir -p /wheels/.pip-flash-cache /wheels/.tmp-flash && \
+      PIP_CACHE_DIR=/wheels/.pip-flash-cache TMPDIR=/wheels/.tmp-flash \
+      python -m pip wheel -w /wheels --no-build-isolation "flash_attn>=2.8.3" && \
+      rm -rf /wheels/.pip-flash-cache /wheels/.tmp-flash; \
+    fi
 
 
 FROM ${BASE_IMAGE} AS runtime
